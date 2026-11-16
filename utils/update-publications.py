@@ -53,9 +53,9 @@ def main():
         entries = bibtexparser.load(source, parser=parser).entries
     references = "\n\n".join(f"{i}. {citation(e)}" for i, e in enumerate(entries, 1))
     sections = {
-        "README.md": "## 相关工作\n\n以下优秀工作使用 OpenUSim 进行仿真验证：",
+        "README.md": "### 研究应用\n\n以下优秀工作使用 OpenUSim 进行仿真验证：",
         "README_en.md": (
-            "## Research Using OpenUSim\n\n"
+            "### OpenUSim in Research\n\n"
             "The following outstanding works use OpenUSim for simulation-based validation:"
         ),
     }

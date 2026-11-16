@@ -40,11 +40,15 @@
 
 ---
 
-**目录**： [项目概述](#项目概述) · [项目架构](#项目架构) · [核心组件](#核心组件) · [OpenUSim Skills](#4-openusim-skills仓库内置) · [许可证](#许可证) · [相关工作](#相关工作) · [引用本项目](#citation) · [答疑交流](#答疑交流)
+**目录**： [项目概述](#项目概述) · [引用本项目](#引用本项目) · [研究应用](#研究应用) · [项目架构](#项目架构) · [核心组件](#核心组件) · [OpenUSim Skills](#4-openusim-skills仓库内置) · [答疑交流](#答疑交流) · [许可证](#许可证)
 
 ## 项目概述
 
 `ns-3-UB` 是基于[灵衢基础规范 2.1 版本](https://www.unifiedbus.com/zh)的 ns-3 仿真模块，实现了功能层、事务层、传输层、网络层和数据链路层的协议框架与配套算法，可用于协议研究、网络架构探索以及拥塞控制、流量控制、负载均衡、路由算法等方向的仿真验证。
+
+本项目基于 ns-3.44 构建。详细的平台支持、安装步骤、系统要求及编译选项，请参阅 [ns-3.44 文档](https://www.nsnam.org/releases/ns-3-44/documentation/)、[安装指南](https://www.nsnam.org/docs/release/3.44/installation/singlehtml/) 及 [ns-3.44 源码](https://gitlab.com/nsnam/ns-3-dev/-/tree/ns-3.44?ref_type=tags)。
+
+本项目已集成 Unison for ns-3 多线程并行仿真能力（[EuroSys '24 paper](https://dl.acm.org/doi/10.1145/3627703.3629574)），更多信息与使用方法参阅 [UNISON_README.md](UNISON_README.md) 和 [QUICK_START.md](QUICK_START.md)。
 
 > 本项目参考灵衢基础规范实现，仿真行为与规范之间可能存在差异。请以灵衢基础规范为权威参考。
 
@@ -163,7 +167,7 @@
       <td>用户可自定义的 VL 间调度策略</td>
     </tr>
     <tr>
-      <td>信用流控</td>
+      <td>链路流控</td>
       <td>CBFC（独占信用 / 共享信用）、PFC（固定阈值 / 动态阈值）</td>
       <td>控制面的信用初始化行为、用户自定义信用共享策略</td>
     </tr>
@@ -174,6 +178,32 @@
     </tr>
   </tbody>
 </table>
+
+## 引用本项目
+
+```bibtex
+@software{openusim,
+  month = {9},
+  title = {{OpenUSim: An Open-Source UnifiedBus Network Simulation Framework}},
+  url = {https://gitcode.com/open-usim/ns-3-ub},
+  version = {2.1.0},
+  year = {2026}
+}
+```
+
+<!-- BEGIN PUBLICATIONS -->
+### 研究应用
+
+以下优秀工作使用 OpenUSim 进行仿真验证：
+
+1. BAO J, ZHU W, ZHAO G, et al. OpDisPath: Optimal Communication Scheduling in GPU Clusters Through Disjoint Path Selection[J]. IEEE Transactions on Networking, 2026, 34: 8011-8026. DOI: [10.1109/ton.2026.3748714](https://doi.org/10.1109/ton.2026.3748714).
+
+2. LIU S, KONG D, WANG H, et al. Balanced Sparse Tree: A Scalable Network Topology for Large Language Models[C]//Proceedings of the ACM SIGCOMM 2026 Conference. New York, NY, USA: ACM, 2026: 676-695. DOI: [10.1145/3789240.3829208](https://doi.org/10.1145/3789240.3829208).
+
+3. WANG Y, ZHANG J, HUANG X, et al. Argus: Scalable and Deterministic Network Fault Localization for AI Training Clusters[C]//Proceedings of the 10th Asia-Pacific Workshop on Networking. New York, NY, USA: ACM, 2026: 51-58. DOI: [10.1145/3820441.3820449](https://doi.org/10.1145/3820441.3820449).
+
+4. LONG F, GAO K, CHEN L, et al. Supercharging Packet-level Network Simulation of Large Model Training via Memoization and Fast-Forwarding[C]//23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26). Renton, WA: USENIX Association, 2026: 1131-1151. [Paper](https://www.usenix.org/conference/nsdi26/presentation/long).
+<!-- END PUBLICATIONS -->
 
 ## 项目架构
 
@@ -226,7 +256,7 @@ UB 模块是基于灵衢基础规范实现的仿真组件：
 
 - **流量注入组件** (`ub-traffic-gen.*`) - 读取用户流量配置，为仿真节点按串并行关系注入流量
 - **TP Connection Manager** (`ub-tp-connection-manager.h`) - TP Channel 管理器，方便用户查找各节点 TP Channel 信息
-- **Switch Allocator** (`ub-allocator.*`) - 建模了交换机为数据包分配出端口的过程
+- **Switch Allocator** (`ub-switch-allocator.*`) - 建模交换机的报文调度与出端口仲裁
 - **Queue Manager** (`ub-queue-manager.*`) - 缓冲区管理模块，影响负载均衡、流量控制、排队、丢包等行为
 - **Routing Process** (`ub-routing-process.*`) - 路由表模块，实现了路由表的管理与查询功能
 - **Congestion Control** (`ub-congestion-control.*`) - 拥塞控制算法框架模块
@@ -245,8 +275,8 @@ UB 模块是基于灵衢基础规范实现的仿真组件：
 #### 拓扑和流量支持
 
 - **任意拓扑**：支持任意拓扑的仿真与建模，用户可基于 UB 工具集快速构建拓扑与路由表
-- **任意流量**：支持任意仿真流量的配置，用户可基于 UB 工具集配合 UbClientDag 快速构建集合通信与通信算子图
-- **性能监控**：全面的性能指标收集和分析
+- **任意流量**：支持任意仿真流量配置，可通过 UB 工具集构建集合通信与通信算子图
+- **性能监控**：收集和分析仿真性能指标
 
 #### 协议栈建模
 
@@ -259,21 +289,17 @@ UB 模块是基于灵衢基础规范实现的仿真组件：
 
 - **流量控制**：实现基于信用的流量控制（CBFC 独占/共享信用）和基于优先级的流量控制（PFC 固定阈值/动态阈值）
 - **拥塞控制**：实现拥塞控制算法常用的网侧标记、接收端回复、发送端响应框架，支持 CAQM 与 DCQCN 算法
-- **路由策略**：支持最短路由、绕路策略，以及逐流/逐包的 Hash、Round Robin、自适应和入端口条带选择
+- **路由策略**：支持最短路由与绕路，提供 Hash、轮询、自适应和入端口条带等路径选择策略
 - **QoS 支持**：提供端到端 QoS 支持，当前支持 SP 与 DWRR 调度策略
 - **交换仲裁**：模块化实现 UB Switch 的交换仲裁机制建模，当前支持 SP 与 DWRR 调度
 
-`network_attribute.txt` 使用 `RoutingType` 表达 UB RT 域：`PER_FLOW_ALL_PATHS`、
-`PER_PACKET_ALL_PATHS`、`PER_FLOW_SHORTEST_PATHS`、`PER_PACKET_SHORTEST_PATHS`。
-路径选择算法由 `ns3::UbRoutingProcess::MultipathSelector` 配置。逐流模式支持
-`HASH64`、`CRC32`、`TOEPLITZ`、`INGRESS_PORT_STRIPE`；逐包模式支持
-`HASH64`、`CRC32`、`TOEPLITZ`、`ROUND_ROBIN`、`ADAPTIVE`。
+路由策略的选择与配置说明见[路由策略指南](.agents/skills/openusim-references/routing-strategy-selection.md)。
 
 ### 3. 脚本工具集
 
-提供完整的网络仿真工作流支持：
+脚本工具集支持以下仿真流程：
 
-- **网络拓扑生成**：自动生成各种网络拓扑（Clos、2D Fullmesh 等）
+- **网络拓扑生成**：自动生成各种网络拓扑（Clos、2D FullMesh 等）
 - **流量模式生成**：支持 All-Reduce、All-to-All、All-to-All-V 等通信模式，支持 RHD、NHR、OneShot 多种集合通信算法
 - **性能分析工具**：吞吐量计算、延迟分析、CDF 绘制
 - **格式化结果输出**：自动生成流完成时间、带宽等基础结果信息表格，可选生成报文粒度网内逐跳信息。
@@ -282,63 +308,18 @@ UB 模块是基于灵衢基础规范实现的仿真组件：
 
 本仓库在 `.agents/skills/` 目录下维护一组 OpenUSim Skills，用于配合 Agent 规划、运行和分析 `ns-3-ub` 仿真。
 
-这些 skills 既支持单次仿真，也支持 A/B 对比、参数 sweep 和控制变量实验。对比类实验会先定下 baseline、待比较配置、固定控制项、预期结果和证据来源，再生成和运行 case。
+这些 skills 支持单次仿真、A/B 对比、参数扫描和控制变量实验，使用说明见 [OpenUSim Skills 文档](.agents/skills/README.md)。
 
-阶段包括：
+主要流程包括四个阶段：
 
 - `openusim-welcome`：检查当前工作树、构建产物和工具链是否可用
 - `openusim-plan-experiment`：把自然语言目标整理成可执行的仿真方案
-- `openusim-run-experiment`：生成 case、补齐配置、执行仿真，并记录明确的运行错误；对比类实验只执行规划好的用例集合
-- `openusim-analyze-results`：解释输出、分析异常，并给出下一轮实验建议；对比类实验会按预期与实测结果对照 baseline 和待比较配置
-- `openusim-capture-insights`：在用户同意后，把已经确认的根因或通用判断写成知识卡
+- `openusim-run-experiment`：生成 case、补齐配置、执行仿真，并记录运行错误
+- `openusim-analyze-results`：解释输出、分析异常，并给出下一轮实验建议
+
+可选的 `openusim-capture-insights` 用于在用户同意后，把已经确认的根因或通用结论写成知识卡。
 
 上述 Skills 与主仓代码及 `ns-3-ub-tools` 子模块紧密耦合，随仓库统一维护。
-
-### UnifiedBus 事务规范范围
-
-当前实现符合灵衢基础规范 2.1 版本的已实现子集：RTP 与 CFG6 CTP 的完整 BTAH 请求和 ATAH 响应、
-规则驱动的 Read/Atomic Payload、outstanding request 响应匹配、Atomic Load/Store 子操作输入
-校验和 Management 状态字段。通用 BE request、ROT、LDST 规范完整性、真实原子值语义及
-Management 命令效果仍属于未实现/范围外；因此项目不声称完整符合灵衢基础规范。
-
-CFG6 CTP 的 requester 使用独立 RCID，并由各自 UbJetty 维护进度。准备时要求
-`1 <= UbJettyInflightMax <= min(JettyOooAckThreshold, 32768)`；参数只能在 requester 完全空闲时修改。
-旧 `ExperimentTaAckPacketBytes` 已删除，维护配置不再接受该项（包括零值）。
-实现和验收记录见 [CTP 完整事务头集成记录](doc/implementation/ctp-full-tah-06.md)。
-
-## 许可证
-
-本项目遵循 ns-3 许可证协议，GPL v2。详见 [`LICENSE`](LICENSE) 文件。
-
-<!-- BEGIN PUBLICATIONS -->
-## 相关工作
-
-以下优秀工作使用 OpenUSim 进行仿真验证：
-
-1. BAO J, ZHU W, ZHAO G, et al. OpDisPath: Optimal Communication Scheduling in GPU Clusters Through Disjoint Path Selection[J]. IEEE Transactions on Networking, 2026, 34: 8011-8026. DOI: [10.1109/ton.2026.3748714](https://doi.org/10.1109/ton.2026.3748714).
-
-2. LIU S, KONG D, WANG H, et al. Balanced Sparse Tree: A Scalable Network Topology for Large Language Models[C]//Proceedings of the ACM SIGCOMM 2026 Conference. New York, NY, USA: ACM, 2026: 676-695. DOI: [10.1145/3789240.3829208](https://doi.org/10.1145/3789240.3829208).
-
-3. WANG Y, ZHANG J, HUANG X, et al. Argus: Scalable and Deterministic Network Fault Localization for AI Training Clusters[C]//Proceedings of the 10th Asia-Pacific Workshop on Networking. New York, NY, USA: ACM, 2026: 51-58. DOI: [10.1145/3820441.3820449](https://doi.org/10.1145/3820441.3820449).
-
-4. LONG F, GAO K, CHEN L, et al. Supercharging Packet-level Network Simulation of Large Model Training via Memoization and Fast-Forwarding[C]//23rd USENIX Symposium on Networked Systems Design and Implementation (NSDI 26). Renton, WA: USENIX Association, 2026: 1131-1151. [Paper](https://www.usenix.org/conference/nsdi26/presentation/long).
-<!-- END PUBLICATIONS -->
-
-## Citation
-
-```bibtex
-@software{UBNetworkSimulator,
-  month = {9},
-  title = {{OpenUSim: Open source UnifiedBus Network Simulation Framework}},
-  url = {https://gitcode.com/open-usim/ns-3-ub},
-  version = {2.1.0},
-  year = {2026}
-}
-```
-
-> 本项目基于 ns-3.44 构建。详细的平台支持、安装步骤、系统要求及编译选项，请参阅 [ns-3.44 文档](https://www.nsnam.org/releases/ns-3-44/documentation/)、[安装指南](https://www.nsnam.org/docs/release/3.44/installation/singlehtml/) 及 [ns-3.44 源码](https://gitlab.com/nsnam/ns-3-dev/-/tree/ns-3.44?ref_type=tags)。
->
-> 本项目已集成 Unison for ns-3 多线程并行仿真能力（[EuroSys '24 paper](https://dl.acm.org/doi/10.1145/3627703.3629574)），更多信息与使用方法参阅 [UNISON_README.md](UNISON_README.md) 和 [QUICK_START.md](QUICK_START.md)。
 
 ## 答疑交流
 
@@ -348,22 +329,12 @@ CFG6 CTP 的 requester 使用独立 RCID，并由各自 UbJetty 维护进度。�
 <img src="https://raw.gitcode.com/user-images/assets/7654616/da776214-666b-4d7c-896a-273f75770264/image.png" width="300" height="300" alt="OpenUSim 答疑交流微信群二维码">
 </p>
 
+## 许可证
+
+本项目遵循 ns-3 许可证协议，GPL v2。详见 [`LICENSE`](LICENSE) 文件。
+
 ---
 
 <p align="center">
   <sub>基于 <a href="https://www.unifiedbus.com/zh">灵衢基础规范</a> 构建 · 基于 <a href="https://www.nsnam.org/releases/ns-3-44/">ns-3.44</a> · GPL-2.0 License</sub>
 </p>
-
-### Reliable rerouting cases
-
-[可靠重路由 case 索引](scratch/reliable-rerouting/README.md) 保留双交换机小 case，
-用于真实 LastAck 握手和双向积压恢复回归；另含
-[128 主机 Clos alltoall](scratch/reliable-rerouting/clos_128nodes_alltoall_64k/README.md)，
-验证无平行备用链路时的多跳握手和 16,256 条传输完成。
-
-```bash
-python3.12 ./ns3 run --no-build 'scratch/ub-quick-example --case-path=scratch/reliable-rerouting/2nodes_reliable-rerouting'
-python3 scratch/reliable-rerouting/2nodes_reliable-rerouting/check_results.py --self-test
-python3 scratch/reliable-rerouting/run_case.py scratch/reliable-rerouting/clos_128nodes_alltoall_64k
-python3 scratch/reliable-rerouting/clos_128nodes_alltoall_64k/check_results.py --self-test
-```
