@@ -40,7 +40,7 @@
 
 ---
 
-**目录**： [项目概述](#项目概述) · [项目架构](#项目架构) · [核心组件](#核心组件) · [OpenUSim Skills](#4-openusim-skills仓库内置) · [许可证](#许可证) · [Citation](#citation) · [答疑交流](#答疑交流)
+**目录**： [项目概述](#项目概述) · [项目架构](#项目架构) · [核心组件](#核心组件) · [OpenUSim Skills](#4-openusim-skills仓库内置) · [许可证](#许可证) · [相关工作](#相关工作) · [引用本项目](#citation) · [答疑交流](#答疑交流)
 
 ## 项目概述
 
@@ -311,9 +311,9 @@ CFG6 CTP 的 requester 使用独立 RCID，并由各自 UbJetty 维护进度。�
 本项目遵循 ns-3 许可证协议，GPL v2。详见 [`LICENSE`](LICENSE) 文件。
 
 <!-- BEGIN PUBLICATIONS -->
-## 引用本项目的论文
+## 相关工作
 
-以下论文引用了 ns-3-UB / OpenUSim。参考文献按 GB/T 7714 风格列出，完整书目信息见 [BibTeX 文件](publications.bib)。
+以下优秀工作使用 OpenUSim 进行仿真验证：
 
 1. BAO J, ZHU W, ZHAO G, et al. OpDisPath: Optimal Communication Scheduling in GPU Clusters Through Disjoint Path Selection[J]. IEEE Transactions on Networking, 2026, 34: 8011-8026. DOI: [10.1109/ton.2026.3748714](https://doi.org/10.1109/ton.2026.3748714).
 
@@ -329,7 +329,7 @@ CFG6 CTP 的 requester 使用独立 RCID，并由各自 UbJetty 维护进度。�
 ```bibtex
 @software{UBNetworkSimulator,
   month = {9},
-  title = {{ns-3-UB: UnifiedBus Network Simulation Framework}},
+  title = {{OpenUSim: Open source UnifiedBus Network Simulation Framework}},
   url = {https://gitcode.com/open-usim/ns-3-ub},
   version = {2.1.0},
   year = {2026}

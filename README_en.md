@@ -40,7 +40,7 @@
 
 ---
 
-**Contents**: [Project Overview](#project-overview) · [Project Architecture](#project-architecture) · [Key Components](#key-components) · [OpenUSim Skills](#4-openusim-skills-repository-bundled) · [License](#license) · [Citation](#citation)
+**Contents**: [Project Overview](#project-overview) · [Project Architecture](#project-architecture) · [Key Components](#key-components) · [OpenUSim Skills](#4-openusim-skills-repository-bundled) · [License](#license) · [Research Using OpenUSim](#research-using-openusim) · [Cite This Project](#citation)
 
 ## Project Overview
 
@@ -309,9 +309,9 @@ therefore does not claim full conformance to the UB Base Specification.
 This project follows the ns-3 license agreement, GPL v2. See the [`LICENSE`](LICENSE) file for details.
 
 <!-- BEGIN PUBLICATIONS -->
-## Papers Citing This Project
+## Research Using OpenUSim
 
-The following papers cite ns-3-UB / OpenUSim. References use GB/T 7714 style; full bibliographic records are available in [BibTeX](publications.bib).
+The following outstanding works use OpenUSim for simulation-based validation:
 
 1. BAO J, ZHU W, ZHAO G, et al. OpDisPath: Optimal Communication Scheduling in GPU Clusters Through Disjoint Path Selection[J]. IEEE Transactions on Networking, 2026, 34: 8011-8026. DOI: [10.1109/ton.2026.3748714](https://doi.org/10.1109/ton.2026.3748714).
 
@@ -327,7 +327,7 @@ The following papers cite ns-3-UB / OpenUSim. References use GB/T 7714 style; fu
 ```bibtex
 @software{UBNetworkSimulator,
   month = {9},
-  title = {{ns-3-UB: UnifiedBus Network Simulation Framework}},
+  title = {{OpenUSim: Open source UnifiedBus Network Simulation Framework}},
   url = {https://gitcode.com/open-usim/ns-3-ub},
   version = {2.1.0},
   year = {2026}

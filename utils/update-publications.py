@@ -53,15 +53,10 @@ def main():
         entries = bibtexparser.load(source, parser=parser).entries
     references = "\n\n".join(f"{i}. {citation(e)}" for i, e in enumerate(entries, 1))
     sections = {
-        "README.md": (
-            "## 引用本项目的论文\n\n"
-            "以下论文引用了 ns-3-UB / OpenUSim。参考文献按 GB/T 7714 风格列出，"
-            "完整书目信息见 [BibTeX 文件](publications.bib)。"
-        ),
+        "README.md": "## 相关工作\n\n以下优秀工作使用 OpenUSim 进行仿真验证：",
         "README_en.md": (
-            "## Papers Citing This Project\n\n"
-            "The following papers cite ns-3-UB / OpenUSim. References use GB/T 7714 style; "
-            "full bibliographic records are available in [BibTeX](publications.bib)."
+            "## Research Using OpenUSim\n\n"
+            "The following outstanding works use OpenUSim for simulation-based validation:"
         ),
     }
     # Read and render both files before writing either one.
