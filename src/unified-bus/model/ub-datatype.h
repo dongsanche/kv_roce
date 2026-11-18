@@ -998,6 +998,11 @@ public:
         return m_taSsnSize;
     }
 
+    uint32_t GetLastAdmittedTaSsn() const
+    {
+        return m_lastAdmittedTaSsn;
+    }
+
     void SetJettyNum(uint32_t jettyNum)
     {
         m_jettyNum = jettyNum;
@@ -1081,6 +1086,13 @@ public:
     void SetCanSend(bool status)
     {
         m_canSend = status;
+    }
+
+    void RecordSegmentAdmission(uint32_t taSsn, uint32_t bytes)
+    {
+        m_lastAdmittedTaSsn = taSsn;
+        m_canSend = true;
+        UpdateSentBytes(bytes);
     }
 
     /**
@@ -1264,6 +1276,7 @@ private:
     std::optional<UbTransactionResolved> m_transactionResolved;
 
     // ========== TA层动态信息 (追踪WQE segment的完成) ==========
+    uint32_t m_lastAdmittedTaSsn{UINT32_MAX};
     uint32_t m_bytesLeft = 0; // 剩余的字节数
 };
 

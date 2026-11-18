@@ -17,6 +17,9 @@
 #include "ns3/ub-transport-channel-manager.h"
 #include "ns3/ub-transport.h"
 
+#include <map>
+#include <vector>
+
 namespace ns3
 {
 namespace
@@ -42,7 +45,7 @@ struct TargetExecutionPair
 };
 
 TargetExecutionPair
-BuildTargetExecutionPair()
+BuildTargetExecutionPair(bool useTpGroup = false)
 {
     Config::Reset();
     GlobalValue::Bind("UB_CC_ENABLED", BooleanValue(false));
@@ -68,34 +71,43 @@ BuildTargetExecutionPair()
 
     Ptr<UbController> senderCtrl = pair.sender->GetObject<UbController>();
     Ptr<UbController> receiverCtrl = pair.receiver->GetObject<UbController>();
-    Connection connection;
-    connection.ownerNodeId = pair.sender->GetId();
-    connection.node1 = pair.sender->GetId();
-    connection.port1 = pair.senderPort->GetIfIndex();
-    connection.tpn1 = kTargetExecutionSenderTpn;
-    connection.node2 = pair.receiver->GetId();
-    connection.port2 = pair.receiverPort->GetIfIndex();
-    connection.tpn2 = kTargetExecutionReceiverTpn;
-    connection.priority = kTargetExecutionPriority;
-    connection.metrics = 0;
-    senderCtrl->GetTpConnManager()->AddUnilateralConnection(connection, pair.sender->GetId());
-    receiverCtrl->GetTpConnManager()->AddUnilateralConnection(connection, pair.receiver->GetId());
-    senderCtrl->GetTransportChannelManager()->CreateTp(pair.sender->GetId(),
-                                                       pair.receiver->GetId(),
-                                                       pair.senderPort->GetIfIndex(),
-                                                       pair.receiverPort->GetIfIndex(),
-                                                       kTargetExecutionPriority,
-                                                       kTargetExecutionSenderTpn,
-                                                       kTargetExecutionReceiverTpn,
-                                                       UbCongestionControl::Create(UB_DEVICE));
-    receiverCtrl->GetTransportChannelManager()->CreateTp(pair.receiver->GetId(),
-                                                         pair.sender->GetId(),
-                                                         pair.receiverPort->GetIfIndex(),
-                                                         pair.senderPort->GetIfIndex(),
-                                                         kTargetExecutionPriority,
-                                                         kTargetExecutionReceiverTpn,
-                                                         kTargetExecutionSenderTpn,
-                                                         UbCongestionControl::Create(UB_DEVICE));
+    std::vector<uint32_t> senderTpns;
+    for (uint32_t i = 0; i < (useTpGroup ? 2u : 1u); ++i)
+    {
+        const uint32_t senderTpn = kTargetExecutionSenderTpn + i;
+        const uint32_t receiverTpn = kTargetExecutionReceiverTpn + i;
+        senderTpns.push_back(senderTpn);
+        Connection connection;
+        connection.ownerNodeId = pair.sender->GetId();
+        connection.node1 = pair.sender->GetId();
+        connection.port1 = pair.senderPort->GetIfIndex();
+        connection.tpn1 = senderTpn;
+        connection.node2 = pair.receiver->GetId();
+        connection.port2 = pair.receiverPort->GetIfIndex();
+        connection.tpn2 = receiverTpn;
+        connection.priority = kTargetExecutionPriority;
+        connection.metrics = 0;
+        senderCtrl->GetTpConnManager()->AddUnilateralConnection(connection, pair.sender->GetId());
+        receiverCtrl->GetTpConnManager()->AddUnilateralConnection(connection,
+                                                                  pair.receiver->GetId());
+        senderCtrl->GetTransportChannelManager()->CreateTp(pair.sender->GetId(),
+                                                           pair.receiver->GetId(),
+                                                           pair.senderPort->GetIfIndex(),
+                                                           pair.receiverPort->GetIfIndex(),
+                                                           kTargetExecutionPriority,
+                                                           senderTpn,
+                                                           receiverTpn,
+                                                           UbCongestionControl::Create(UB_DEVICE));
+        auto receiverTps = receiverCtrl->GetTransportChannelManager();
+        receiverTps->CreateTp(pair.receiver->GetId(),
+                              pair.sender->GetId(),
+                              pair.receiverPort->GetIfIndex(),
+                              pair.senderPort->GetIfIndex(),
+                              kTargetExecutionPriority,
+                              receiverTpn,
+                              senderTpn,
+                              UbCongestionControl::Create(UB_DEVICE));
+    }
 
     pair.senderTp = senderCtrl->GetTransportChannelManager()->GetTp(kTargetExecutionSenderTpn);
     pair.receiverTp =
@@ -110,9 +122,9 @@ BuildTargetExecutionPair()
     NS_ABORT_MSG_IF(!pair.senderTransaction->JettyBindTp(pair.sender->GetId(),
                                                          pair.receiver->GetId(),
                                                          kTargetExecutionJettyNum,
-                                                         false,
-                                                         {kTargetExecutionSenderTpn}),
-                    "sender Jetty must bind to the direct TP");
+                                                         useTpGroup,
+                                                         senderTpns),
+                    "sender Jetty must bind to the fixture transport");
     pair.senderJetty = pair.senderFunction->GetJetty(kTargetExecutionJettyNum);
     return pair;
 }
@@ -497,6 +509,110 @@ class UbTargetExecutorAsyncAndDedupTest : public TestCase
     uint32_t m_responseCount{0};
 };
 
+class UbInterleavedWriteCompletionTest : public TestCase
+{
+  public:
+    UbInterleavedWriteCompletionTest(const std::string& name, UbWorkOutcome firstOutcome)
+        : TestCase(name),
+          m_firstOutcome(firstOutcome)
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        const bool abortGroup = m_firstOutcome == UbWorkOutcome::FAILED;
+        const bool holdFirst = m_firstOutcome != UbWorkOutcome::COMPLETED;
+        TargetExecutionPair pair = BuildTargetExecutionPair(abortGroup);
+        pair.senderJetty->SetTaSegmentBytes(64);
+        std::map<uint32_t, std::pair<uint32_t, UbTargetCompletion>> replies;
+        pair.receiverTransaction->SetTargetExecutor(UbTargetExecutor(
+            [&replies](Ptr<const UbWqeSegment> request, const UbTransactionRule&,
+                       UbTargetCompletion done) {
+                replies.emplace(request->GetTaSsn(), std::make_pair(request->GetTaskId(), done));
+            }));
+        pair.senderJetty->SetWqeCompletionCallback(
+            MakeCallback(&UbInterleavedWriteCompletionTest::OnCompletion, this));
+
+        for (uint32_t taskId : {1u, 2u})
+        {
+            auto wqe = pair.senderFunction->CreateWqe(pair.sender->GetId(), pair.receiver->GetId(),
+                                                      128, taskId, UbTransactionOpcode::WRITE);
+            auto result = pair.senderFunction->SubmitWqe(wqe, kTargetExecutionJettyNum);
+            NS_TEST_ASSERT_MSG_EQ(static_cast<uint32_t>(result.status),
+                                  static_cast<uint32_t>(UbWqeSubmissionStatus::ACCEPTED),
+                                  "both WRITEs must be in flight on the same Jetty");
+        }
+        Simulator::Stop(MicroSeconds(10));
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(replies.size(), 4u, "the target must receive all four segments");
+
+        // Holding the first WQE leaves a hole even after both TAACKs arrive for its peer.
+        std::map<uint32_t, uint32_t> answered;
+        for (const auto& [taSsn, reply] : replies)
+        {
+            const auto& [taskId, done] = reply;
+            NS_TEST_ASSERT_MSG_EQ(taskId, 1 + taSsn % 2, "the two WRITEs must interleave");
+            if (holdFirst && taskId == 1)
+            {
+                continue;
+            }
+            ++answered[taskId];
+            done(UbWorkExecutionResult{});
+            Simulator::Stop(MicroSeconds(10));
+            Simulator::Run();
+            for (uint32_t id : {1u, 2u})
+            {
+                const bool ready = !holdFirst && answered[id] == 2;
+                NS_TEST_EXPECT_MSG_EQ(m_outcomes[id].size(), (ready ? 1u : 0u),
+                                      "callback count for WQE " << id << " after TAACK " << taSsn);
+            }
+        }
+        if (holdFirst)
+        {
+            if (abortGroup)
+            {
+                const auto* binding =
+                    pair.senderTransaction->FindRtpTransportReference(kTargetExecutionJettyNum);
+                NS_TEST_ASSERT_MSG_NE(binding, nullptr, "group binding exists");
+                NS_TEST_ASSERT_MSG_EQ(binding->IsDirectTp(), false, "use real TP group teardown");
+                const auto group = binding->GetIdentity();
+                pair.sender->GetObject<UbController>()->DestroyRtpTpGroup(group,
+                                                                        UbDestroyReason::ERROR);
+            }
+            else
+            {
+                pair.senderTransaction->CompleteWqeOperation(kTargetExecutionJettyNum, 1,
+                                                            UbWorkOutcome::CANCELED);
+            }
+            NS_TEST_EXPECT_MSG_EQ(m_outcomes[2].size(), 1u,
+                                  "the peer reaches its outcome before any late TAACK");
+            replies.at(0).second(UbWorkExecutionResult{});
+            replies.at(2).second(UbWorkExecutionResult{});
+            Simulator::Stop(MicroSeconds(10));
+            Simulator::Run();
+        }
+        const auto peerOutcome = abortGroup ? UbWorkOutcome::FAILED : UbWorkOutcome::COMPLETED;
+        for (uint32_t id : {1u, 2u})
+        {
+            const auto expected = id == 1 ? m_firstOutcome : peerOutcome;
+            NS_TEST_ASSERT_MSG_EQ(m_outcomes[id].size(), 1u, "each WRITE has exactly one outcome");
+            NS_TEST_EXPECT_MSG_EQ(static_cast<unsigned>(m_outcomes[id].front()),
+                                  static_cast<unsigned>(expected),
+                                  "terminal outcome for WQE " << id);
+        }
+        Simulator::Destroy();
+    }
+
+    void OnCompletion(UbWqeCompletion completion)
+    {
+        m_outcomes[completion.wqeId].push_back(completion.outcome);
+    }
+
+    UbWorkOutcome m_firstOutcome;
+    std::map<uint32_t, std::vector<UbWorkOutcome>> m_outcomes;
+};
+
 class UbTargetExecutionSeamSuite : public TestSuite
 {
   public:
@@ -505,6 +621,15 @@ class UbTargetExecutionSeamSuite : public TestSuite
         AddTestCase(new UbTargetExecutionInboundPathTest, TestCase::Duration::QUICK);
         AddTestCase(new UbTargetExecutionDelayTimingTest, TestCase::Duration::QUICK);
         AddTestCase(new UbTargetExecutorAsyncAndDedupTest, TestCase::Duration::QUICK);
+        AddTestCase(new UbInterleavedWriteCompletionTest(
+                        "each interleaved RTP WRITE waits for its own final TAACK",
+                        UbWorkOutcome::COMPLETED), TestCase::Duration::QUICK);
+        AddTestCase(new UbInterleavedWriteCompletionTest(
+                        "canceling an interleaved WRITE releases a fully answered peer",
+                        UbWorkOutcome::CANCELED), TestCase::Duration::QUICK);
+        AddTestCase(new UbInterleavedWriteCompletionTest(
+                        "aborting the TP group fails both pending interleaved WRITEs",
+                        UbWorkOutcome::FAILED), TestCase::Duration::QUICK);
     }
 } g_ubTargetExecutionSeamSuite;
 } // namespace ns3
