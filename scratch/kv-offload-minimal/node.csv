@@ -1,0 +1,4 @@
+nodeId,nodeType,portNum,allocationDelay,forwardDelay,rocePortCount,flowControl
+0,DEVICE,1,1ns,,,
+1,1825,2,1ns,,1,
+2,DEVICE,1,1ns,,,PFC_DYNAMIC

@@ -550,7 +550,9 @@ namespace ns3 {
 
         bool IsRoiMemoryRequest(const Ptr<UbWqeSegment>& segment);
         void ValidateRoiServiceModeOrDie(uint32_t jettyNum, const Ptr<UbWqeSegment>& segment);
-        void EnqueueInboundTaResponse(uint32_t localTpn, Ptr<UbWqeSegment> response);
+        void EnqueueInboundTaResponse(uint32_t localTpn,
+                                  Ptr<UbWqeSegment> response,
+                                  Ptr<UbWqeSegment> request = nullptr);
         void CompleteLocalRequestFromResponse(Ptr<UbWqeSegment> response);
         uint64_t DeriveRemoteAddress(const Ptr<UbWqeSegment>& request) const;
 
@@ -574,6 +576,10 @@ namespace ns3 {
         void ReleasePendingInboundRequest(uint32_t localTpn);
         std::vector<EventId> m_delayedInboundEvents;
         std::map<uint32_t, uint32_t> m_pendingInboundRequestsByTpn;
+
+        // 每个 Jetty 最近一次过 SSD 的 WQE id：同一读/写的多个 TA segment 共享同一个 id，
+        // 据此让 SSD 的固定 latency 只按事务收一次，而不是按 segment 重复收。
+        std::map<uint32_t, uint32_t> m_lastSsdTaskIdByJetty;
 
         uint32_t m_nodeId;
         UbController* m_ownerController{nullptr};

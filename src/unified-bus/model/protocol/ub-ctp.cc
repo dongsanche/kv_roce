@@ -10,6 +10,7 @@
 #include "ub-transaction.h"
 
 #include "ns3/boolean.h"
+#include "ns3/double.h"
 #include "ns3/global-value.h"
 #include "ns3/hash.h"
 #include "ns3/log.h"
@@ -30,6 +31,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <utility>
 
 namespace ns3
 {
@@ -521,6 +523,56 @@ UbCtpTransportService::GetTypeId(void)
                           "Experiment hook: delay duration for matching TAACK.",
                           TimeValue(NanoSeconds(0)),
                           MakeTimeAccessor(&UbCtpTransportService::m_delayTaAckTime),
+                          MakeTimeChecker())
+            .AddAttribute("CcEnabled",
+                          "Enable CTP coarse-grained rate control ({dest Entity, VL}).",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbCtpTransportService::m_ccEnabled),
+                          MakeBooleanChecker())
+            .AddAttribute("CcLineRate",
+                          "CTP congestion-control sender line rate.",
+                          DataRateValue(DataRate("400Gbps")),
+                          MakeDataRateAccessor(&UbCtpTransportService::m_lineRate),
+                          MakeDataRateChecker())
+            .AddAttribute("CcInitialRate",
+                          "CTP congestion-control sender initial rate.",
+                          DataRateValue(DataRate("400Gbps")),
+                          MakeDataRateAccessor(&UbCtpTransportService::m_initialRate),
+                          MakeDataRateChecker())
+            .AddAttribute("CcRateAi",
+                          "CTP additive target-rate increase after fast recovery.",
+                          DataRateValue(DataRate("40Mbps")),
+                          MakeDataRateAccessor(&UbCtpTransportService::m_rateAi),
+                          MakeDataRateChecker())
+            .AddAttribute("CcHyperAiRate",
+                          "CTP hyper increase target-rate increase.",
+                          DataRateValue(DataRate("100Mbps")),
+                          MakeDataRateAccessor(&UbCtpTransportService::m_rateHai),
+                          MakeDataRateChecker())
+            .AddAttribute("CcRateIncreaseTimer",
+                          "CTP congestion-control rate increase timer.",
+                          TimeValue(MicroSeconds(55)),
+                          MakeTimeAccessor(&UbCtpTransportService::m_rateIncreaseTimer),
+                          MakeTimeChecker())
+            .AddAttribute("CcByteCounterThreshold",
+                          "Byte threshold before additive target-rate increase.",
+                          UintegerValue(10 * 1024 * 1024),
+                          MakeUintegerAccessor(&UbCtpTransportService::m_byteCounterThreshold),
+                          MakeUintegerChecker<uint64_t>())
+            .AddAttribute("CcFastRecoveryLimit",
+                          "CTP recovery threshold F used by the recovery state machine.",
+                          UintegerValue(5),
+                          MakeUintegerAccessor(&UbCtpTransportService::m_fastRecoveryLimit),
+                          MakeUintegerChecker<uint32_t>())
+            .AddAttribute("CcAlphaGain",
+                          "CTP alpha EWMA gain g.",
+                          DoubleValue(1.0 / 256.0),
+                          MakeDoubleAccessor(&UbCtpTransportService::m_alphaGain),
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("CcCnpInterval",
+                          "Minimum interval between CNP packets for one {destination Entity, VL}.",
+                          TimeValue(MicroSeconds(50)),
+                          MakeTimeAccessor(&UbCtpTransportService::m_cnpInterval),
                           MakeTimeChecker())
             .AddTraceSource(
                 "FirstPacketSendsNotify",
@@ -1094,10 +1146,19 @@ UbCtpTransportService::TryContinueJettyTransmission(const UbCtpEntityKey& entity
             segment = nullptr;
         }
         if (segment == nullptr) return;
+        const UbCtpCongestionKey ccKey{.dstNodeId = key.dstNodeId,
+                                       .dstEntityId = key.dstEntityId,
+                                       .vl = key.vl};
+        if (IsCcLimited(ccKey, segment->GetSize()))
+        {
+            SchedulePacingWakeup(ccKey);
+            return;
+        }
         transaction->CommitCtpWqeSegment(segment);
         TraceWindowEvent(MakeTxKeyForSegment(key, segment), "admit", segment->GetTaSsn(),
                          *transaction->GetJetty(segment->GetJettyNum()));
         NS_ABORT_MSG_IF(!SendSegment(segment, key), "Admitted CTP segment lost its exact owner");
+        OnSenderDataPacketSent(ccKey, segment->GetSize());
     }
 }
 
@@ -1137,6 +1198,7 @@ UbCtpTransportService::HandleReceivedPacket(Ptr<Packet> packet, uint32_t ingress
     {
         return false;
     }
+    const uint8_t fecn = cnaHeader.GetFecn();
 
     UbCtpHeader ctpHeader;
     if (!remove(ctpHeader))
@@ -1215,10 +1277,48 @@ UbCtpTransportService::HandleReceivedPacket(Ptr<Packet> packet, uint32_t ingress
     {
         ++GetOrCreateEntityState(localKey).Rx().receivedPackets;
         RecordCnpForTest(localKey);
+        const UbCtpCongestionKey ccKey{.dstNodeId = localKey.dstNodeId,
+                                       .dstEntityId = localKey.dstEntityId,
+                                       .vl = localKey.vl};
+        uint8_t ecn = 1;
+        uint32_t rateMbps = 0;
+        if (copy->GetSize() >= UbCnpExtTph().GetSerializedSize())
+        {
+            UbCnpExtTph cnpTph;
+            if (copy->RemoveHeader(cnpTph) != 0)
+            {
+                ecn = cnpTph.GetEcn();
+                rateMbps = cnpTph.GetRateMbps();
+            }
+        }
+        if (rateMbps > 0)
+        {
+            OnExternalRate(ccKey, static_cast<uint64_t>(rateMbps) * 1000000ULL);
+        }
+        else
+        {
+            OnCnpReceived(ccKey, ecn);
+        }
         return true;
     }
     if (ctpHeader.GetTPOpcode() != static_cast<uint8_t>(CtpOpcode::CTP_DATA))
         return false;
+    if (m_ccEnabled && fecn != 0)
+    {
+        const UbCtpCongestionKey ccKey{.dstNodeId = localKey.dstNodeId,
+                                       .dstEntityId = localKey.dstEntityId,
+                                       .vl = localKey.vl};
+        const Time now = Simulator::Now();
+        const auto last = m_lastCnpSentByKey.find(ccKey);
+        if (last == m_lastCnpSentByKey.end() || now - last->second >= m_cnpInterval)
+        {
+            m_lastCnpSentByKey[ccKey] = now;
+            const bool sourcePortExplicit = (cnaHeader.GetScna() & 0xF) != 0;
+            const uint32_t sourcePort =
+                sourcePortExplicit ? utils::Cna16ToPortId(cnaHeader.GetScna()) : UINT32_MAX;
+            SendCnp(localKey, receivePort, sourcePort);
+        }
+    }
     const uint32_t padding = ctpHeader.GetPadding();
     if (nthBytes % 4 != 0 || padding > 3 || copy->GetSize() < padding)
         return reject("invalid carrier padding length");
@@ -1521,10 +1621,297 @@ UbCtpTransportService::RecordCnpForTest(const UbCtpEntityKey& key)
     ++m_congestionSignals[congestionKey];
 }
 
+DataRate
+UbCtpTransportService::DeriveLineRate() const
+{
+    if (m_node == nullptr)
+    {
+        return m_lineRate;
+    }
+    DataRate best{"0bps"};
+    for (uint32_t index = 0; index < m_node->GetNDevices(); ++index)
+    {
+        Ptr<UbPort> port = DynamicCast<UbPort>(m_node->GetDevice(index));
+        if (port != nullptr && port->GetDataRate() > best)
+        {
+            best = port->GetDataRate();
+        }
+    }
+    return best.GetBitRate() == 0 ? m_lineRate : best;
+}
+
+uint64_t
+UbCtpTransportService::ClampBitRate(uint64_t bitRate) const
+{
+    return std::max<uint64_t>(1u, std::min<uint64_t>(bitRate, DeriveLineRate().GetBitRate()));
+}
+
+CtpCongestionState&
+UbCtpTransportService::GetOrCreateCongestionState(const UbCtpCongestionKey& key)
+{
+    auto it = m_congestionStates.find(key);
+    if (it == m_congestionStates.end())
+    {
+        CtpCongestionState state;
+        state.currentRate = DeriveLineRate();
+        state.targetRate = state.currentRate;
+        state.nextAvailableSendTime = Simulator::Now();
+        it = m_congestionStates.emplace(key, std::move(state)).first;
+    }
+    return it->second;
+}
+
+bool
+UbCtpTransportService::IsCcLimited(const UbCtpCongestionKey& key, uint32_t bytes)
+{
+    (void)bytes;
+    if (!m_ccEnabled)
+    {
+        return false;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    if (!state.senderStarted)
+    {
+        state.currentRate = DeriveLineRate();
+        state.targetRate = state.currentRate;
+        state.nextAvailableSendTime = Simulator::Now();
+        state.senderStarted = true;
+    }
+    return Simulator::Now() < state.nextAvailableSendTime;
+}
+
+void
+UbCtpTransportService::OnSenderDataPacketSent(const UbCtpCongestionKey& key, uint32_t bytes)
+{
+    if (!m_ccEnabled || bytes == 0)
+    {
+        return;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    const Time now = Simulator::Now();
+    if (state.nextAvailableSendTime < now)
+    {
+        state.nextAvailableSendTime = now;
+    }
+    const double seconds =
+        static_cast<double>(bytes) * 8.0 / static_cast<double>(state.currentRate.GetBitRate());
+    state.nextAvailableSendTime += Seconds(seconds);
+    state.bytesSinceLastIncrease += bytes;
+    while (m_byteCounterThreshold > 0 && state.bytesSinceLastIncrease >= m_byteCounterThreshold)
+    {
+        state.bytesSinceLastIncrease -= m_byteCounterThreshold;
+        ++state.recoveryEvents;
+        state.targetRate =
+            DataRate(ClampBitRate(state.targetRate.GetBitRate() + m_rateHai.GetBitRate()));
+        state.currentRate = DataRate(ClampBitRate(
+            (state.currentRate.GetBitRate() + state.targetRate.GetBitRate()) / 2));
+    }
+}
+
+void
+UbCtpTransportService::OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn)
+{
+    (void)ecn;
+    if (!m_ccEnabled)
+    {
+        return;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    if (!state.senderStarted)
+    {
+        return;
+    }
+    state.recoveryEvents = 0;
+    state.bytesSinceLastIncrease = 0;
+    const double cutFactor = 1.0 - state.alpha / 2.0;
+    const uint64_t nextBitRate =
+        ClampBitRate(static_cast<uint64_t>(state.currentRate.GetBitRate() * cutFactor));
+    const uint64_t previousBitRate = state.currentRate.GetBitRate();
+    state.currentRate = DataRate(nextBitRate);
+    const Time now = Simulator::Now();
+    if (previousBitRate > 0 && state.nextAvailableSendTime > now && nextBitRate > 0)
+    {
+        const Time outstandingDebt = state.nextAvailableSendTime - now;
+        const double rescale = static_cast<double>(previousBitRate) / static_cast<double>(nextBitRate);
+        state.nextAvailableSendTime = now + Seconds(outstandingDebt.GetSeconds() * rescale);
+    }
+    state.alpha = (1.0 - m_alphaGain) * state.alpha + m_alphaGain;
+    utils::UbUtils::CtpCnpNotify(m_node == nullptr ? UINT32_MAX : m_node->GetId(),
+                                  key.dstNodeId, key.dstEntityId, key.vl, "RX");
+    utils::UbUtils::CtpSenderStateNotify(m_node == nullptr ? UINT32_MAX : m_node->GetId(),
+                                          key.dstNodeId, key.dstEntityId, key.vl,
+                                          "CNP_RATE_CUT", state.alpha, state.currentRate.GetBitRate());
+    // 恢复定时器独立运行：CNP 只降速，不重置恢复节奏，避免「CNP 间隔 < 恢复定时器」时
+    // 恢复定时器永远被取消、速率只降不升。
+    if (!state.rateIncreaseEvent.IsPending())
+    {
+        state.rateIncreaseEvent = Simulator::Schedule(
+            m_rateIncreaseTimer, &UbCtpTransportService::HandleRateIncreaseTimer, this, key);
+    }
+}
+
+void
+UbCtpTransportService::OnExternalRate(const UbCtpCongestionKey& key, uint64_t rateBps)
+{
+    if (!m_ccEnabled)
+    {
+        return;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    state.senderStarted = true;
+    const uint64_t clamped =
+        std::max<uint64_t>(1u, std::min<uint64_t>(rateBps, DeriveLineRate().GetBitRate()));
+    state.currentRate = DataRate(clamped);
+    state.targetRate = DataRate(clamped);
+    state.recoveryEvents = 0;
+    state.bytesSinceLastIncrease = 0;
+    if (state.rateIncreaseEvent.IsPending())
+    {
+        state.rateIncreaseEvent.Cancel();
+    }
+}
+
+void
+UbCtpTransportService::HandleRateIncreaseTimer(UbCtpCongestionKey key)
+{
+    if (!m_ccEnabled)
+    {
+        return;
+    }
+    auto it = m_congestionStates.find(key);
+    if (it == m_congestionStates.end())
+    {
+        return;
+    }
+    CtpCongestionState& state = it->second;
+    state.rateIncreaseEvent = EventId();
+    state.currentRate = DataRate(
+        ClampBitRate(state.currentRate.GetBitRate() + m_rateAi.GetBitRate()));
+    state.targetRate = state.currentRate;
+    const uint64_t lineRateBps = DeriveLineRate().GetBitRate();
+    if (state.currentRate.GetBitRate() >= lineRateBps)
+    {
+        state.currentRate = DataRate(lineRateBps);
+        state.targetRate = DataRate(lineRateBps);
+        state.alpha = 1.0;
+        return;
+    }
+    state.rateIncreaseEvent =
+        Simulator::Schedule(m_rateIncreaseTimer, &UbCtpTransportService::HandleRateIncreaseTimer, this, key);
+}
+
+void
+UbCtpTransportService::DrainPendingResponses(UbCtpCongestionKey ccKey, UbCtpEntityKey key)
+{
+    CtpCongestionState& state = GetOrCreateCongestionState(ccKey);
+    state.pacingWakeupEvent = EventId();
+    auto& q = m_pendingResponsesByKey[ccKey];
+    while (!q.empty())
+    {
+        Ptr<UbWqeSegment> response = q.front();
+        if (IsCcLimited(ccKey, static_cast<uint32_t>(response->GetBytesLeft())))
+        {
+            const Time now = Simulator::Now();
+            const Time delay = state.nextAvailableSendTime > now
+                                   ? (state.nextAvailableSendTime - now)
+                                   : Time(0);
+            state.pacingWakeupEvent = Simulator::Schedule(
+                delay, &UbCtpTransportService::DrainPendingResponses, this, ccKey, key);
+            return;
+        }
+        q.pop();
+        auto& st = GetOrCreateEntityState(key);
+        SendResponseSegment(response, st);
+    }
+    m_pendingResponsesByKey.erase(ccKey);
+}
+
+void
+UbCtpTransportService::SchedulePacingWakeup(const UbCtpCongestionKey& key)
+{
+    if (!m_ccEnabled)
+    {
+        return;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    if (state.pacingWakeupEvent.IsPending())
+    {
+        return;
+    }
+    const Time now = Simulator::Now();
+    const Time delay = state.nextAvailableSendTime > now ? (state.nextAvailableSendTime - now)
+                                                          : Time(0);
+    const auto self = this;
+    state.pacingWakeupEvent = Simulator::Schedule(delay, [self, key]() {
+        CtpCongestionState& s = self->m_congestionStates[key];
+        s.pacingWakeupEvent = EventId();
+        for (const auto& [entityKey, jettys] : self->m_keyJettys)
+        {
+            if (entityKey.dstNodeId == key.dstNodeId && entityKey.dstEntityId == key.dstEntityId &&
+                entityKey.vl == key.vl)
+            {
+                self->TryContinueJettyTransmission(entityKey);
+                break;
+            }
+        }
+    });
+}
+
 uint32_t
 UbCtpTransportService::GetQueueCount() const
 {
     return static_cast<uint32_t>(m_queues.size());
+}
+
+void
+UbCtpTransportService::SendCnp(const UbCtpEntityKey& key, uint32_t outPort, uint32_t dstPortId)
+{
+    if (m_node == nullptr)
+    {
+        return;
+    }
+    Ptr<Packet> packet = Create<Packet>();
+
+    UbCompactEidHeader eidHeader;
+    eidHeader.SetSourceEid(key.srcEntityId);
+    eidHeader.SetDestinationEid(key.dstEntityId);
+    packet->AddHeader(eidHeader);
+
+    UbCompactUpiHeader upiHeader;
+    upiHeader.SetUpi(0);
+    packet->AddHeader(upiHeader);
+
+    UbCtpHeader ctpHeader;
+    ctpHeader.SetTPOpcode(CtpOpcode::CTP_CNP);
+    ctpHeader.SetNlp(UB_CTPH_NLP_UPI16_EID40_TAH);
+    packet->AddHeader(ctpHeader);
+
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(m_node->GetId())));
+    cnaHeader.SetDcna(static_cast<uint16_t>(
+        dstPortId == UINT32_MAX ? utils::NodeIdToCna16(key.dstNodeId)
+                                : utils::NodeIdToCna16(key.dstNodeId, dstPortId)));
+    cnaHeader.SetServiceLevel(key.vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_CTPH);
+    packet->AddHeader(cnaHeader);
+
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                key.vl,
+                                key.vl,
+                                m_defaultRoutingPolicy.routingType,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+
+    Ptr<UbCtpTxQueue> queue = GetOrCreateQueue(key, outPort, key.vl);
+    RegisterQueueIfNeeded(queue, outPort, key.vl);
+    queue->EnqueueCnp(packet);
+
+    utils::UbUtils::CtpCnpNotify(m_node->GetId(), key.dstNodeId, key.dstEntityId, key.vl, "TX");
+
+    Ptr<UbPort> port = DynamicCast<UbPort>(m_node->GetDevice(outPort));
+    NS_ABORT_MSG_IF(port == nullptr, "CTP CNP send requires valid out port");
+    port->TriggerTransmit();
 }
 
 uint32_t
@@ -1701,6 +2088,25 @@ UbCtpTransportService::SendResponseSegment(Ptr<UbWqeSegment> response, UbCtpEnti
     if (!response->IsSentCompleted())
     {
         const uint32_t progressBytes = static_cast<uint32_t>(response->GetBytesLeft());
+        const UbCtpCongestionKey ccKey{.dstNodeId = key.dstNodeId,
+                                       .dstEntityId = key.dstEntityId,
+                                       .vl = key.vl};
+        if (IsCcLimited(ccKey, progressBytes))
+        {
+            CtpCongestionState& ccState = GetOrCreateCongestionState(ccKey);
+            m_pendingResponsesByKey[ccKey].push(response);
+            if (!ccState.pacingWakeupEvent.IsPending())
+            {
+                const Time now = Simulator::Now();
+                const Time delay = ccState.nextAvailableSendTime > now
+                                       ? (ccState.nextAvailableSendTime - now)
+                                       : Time(0);
+                const auto self = this;
+                ccState.pacingWakeupEvent = Simulator::Schedule(
+                    delay, &UbCtpTransportService::DrainPendingResponses, this, ccKey, key);
+            }
+            return false;
+        }
         const uint16_t lbSalt = NextLoadBalanceSalt(state, key);
         const uint32_t outPort = SelectOutPort(response, state, key, lbSalt);
         Ptr<Packet> packet = BuildDataPacketWithTaSsn(response,
@@ -1713,6 +2119,7 @@ UbCtpTransportService::SendResponseSegment(Ptr<UbWqeSegment> response, UbCtpEnti
         RegisterQueueIfNeeded(queue, outPort, key.vl);
         queue->EnqueueData(packet);
         response->UpdateSentBytes(progressBytes);
+        OnSenderDataPacketSent(ccKey, progressBytes);
 
         Ptr<UbPort> port = DynamicCast<UbPort>(m_node->GetDevice(outPort));
         NS_ABORT_MSG_IF(port == nullptr, "CTP response send requires valid out port");

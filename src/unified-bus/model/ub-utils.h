@@ -63,6 +63,8 @@ struct UbStructuredNodeConfig
     std::string allocationDelay;
     std::string forwardDelay;
     uint32_t systemId{0};
+    uint32_t rocePortCount{0};
+    std::string flowControl;
 };
 
 struct UbStructuredLinkConfig
@@ -340,6 +342,20 @@ public:
                                        uint32_t timeRecoveryEvents,
                                        uint32_t byteRecoveryEvents);
 
+    static void CtpCnpNotify(uint32_t nodeId,
+                             uint32_t dstNodeId,
+                             uint32_t dstEntityId,
+                             uint8_t vl,
+                             const std::string& action);
+
+    static void CtpSenderStateNotify(uint32_t nodeId,
+                                     uint32_t dstNodeId,
+                                     uint32_t dstEntityId,
+                                     uint8_t vl,
+                                     const std::string& reason,
+                                     double alpha,
+                                     uint64_t currentRateBps);
+
     static void CaqmAckNotify(uint32_t nodeId,
                               uint32_t tpn,
                               uint32_t psnStart,
@@ -525,6 +541,10 @@ private:
         std::string allocationDelay;
 
         std::string systemIdStr;
+
+        std::string rocePortCountStr;
+
+        std::string flowControlStr;
     };
 
     std::map<uint32_t, NodeEle> nodeEle_map;

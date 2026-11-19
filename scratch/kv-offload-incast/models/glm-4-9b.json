@@ -1,0 +1,10 @@
+{
+  "name": "GLM-4-9B",
+  "num_layers": 40,
+  "hidden_size": 4096,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "intermediate_size": 13696,
+  "bytes_per_param": 2
+}

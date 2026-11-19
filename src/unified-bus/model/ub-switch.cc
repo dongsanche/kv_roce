@@ -319,7 +319,7 @@ void UbSwitch::InitNodePortsFlowControl()
     for (uint32_t pidx = 0; pidx < m_portsNum; pidx++) {
         Ptr<UbPort> port = DynamicCast<ns3::UbPort>(GetObject<Node>()->GetDevice(pidx));
         ApplyLocalPortFlowControlConfig(port);
-        port->CreateAndInitFc(m_flowControlType);
+        port->CreateAndInitFc(GetFlowControlTypeForPort(pidx));
     }
 }
 
@@ -508,12 +508,13 @@ UbSwitch::FinalizeForwardedPacketEnqueue(Ptr<Packet> packet,
 
     // A recovery transfer re-enters an existing packet that already reported its arrival-time
     // congestion effect; re-running the post-enqueue hook would double count it.
-    if (m_congestionCtrl != nullptr && !recoveryTransfer && GetPacketType(packet) != UB_LAST_ACK_PACKET)
+    if (m_congestionCtrl != nullptr && !recoveryTransfer && GetPacketType(packet) != UB_LAST_ACK_PACKET &&
+        IsCongestionMarkingEnabled())
     {
         m_congestionCtrl->OnSwitchPostEnqueue(inPort, outPort, packet);
     }
 
-    if (IsPFCEnable()) {
+    if (IsPortPfc(inPort)) {
         recvPort->GetFlowControl()->OnIngressEnqueued(
             MakeIngressFlowControlEventContext(packet,
                                                GetOrCreateVoq(outPort, priority, inPort),
@@ -724,19 +725,19 @@ void UbSwitch::SwitchHandlePacket(Ptr<UbPort> port, Ptr<Packet> packet)
             port->GetFlowControl()->OnControlFrameReceived(packet);
             break;
         case UB_URMA_DATA_PACKET:
-            if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+            if (IsPortCbfc(port->GetIfIndex())) {
                 port->GetFlowControl()->OnDataPacketReceived(packet);
             }
             HandleURMADataPacket(port, packet);
             break;
         case UB_LDST_DATA_PACKET:
-            if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+            if (IsPortCbfc(port->GetIfIndex())) {
                 port->GetFlowControl()->OnDataPacketReceived(packet);
             }
             HandleLdstDataPacket(port, packet);
             break;
         case UB_CTP_DATA_PACKET:
-            if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+            if (IsPortCbfc(port->GetIfIndex())) {
                 port->GetFlowControl()->OnDataPacketReceived(packet);
             }
             HandleCtpDataPacket(port, packet);
@@ -828,7 +829,7 @@ bool UbSwitch::SinkTpDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Pars
     }
     // Sink
     NS_LOG_DEBUG("[UbPort recv] Pkt tb is local");
-    if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+    if (IsPortCbfc(port->GetIfIndex())) {
         port->GetFlowControl()->OnIngressEnqueued(
             MakeIngressFlowControlEventContext(packet,
                                                nullptr,
@@ -902,7 +903,7 @@ bool UbSwitch::SinkLdstDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Pa
                         "LDST destination endpoint port does not match the receiving UB port");
     }
     // Sink Packet
-    if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+    if (IsPortCbfc(port->GetIfIndex())) {
         port->GetFlowControl()->OnIngressEnqueued(
             MakeIngressFlowControlEventContext(packet,
                                                nullptr,
@@ -947,7 +948,7 @@ bool UbSwitch::SinkCtpDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                         "port");
     }
 
-    if (IsCBFCEnable() || IsCBFCSharedEnable()) {
+    if (IsPortCbfc(port->GetIfIndex())) {
         port->GetFlowControl()->OnIngressEnqueued(
             MakeIngressFlowControlEventContext(packet,
                                                nullptr,
@@ -1063,6 +1064,10 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "Unified-bus reserves priority 0 for locally generated control frames in the "
                     "simulator model. Data packets must use priority 1..15.");
 
+    if (DirectForwardCtpDataPacket(packet, headers, inPort, static_cast<uint32_t>(outPort), priority)) {
+        return;
+    }
+
     if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
@@ -1070,7 +1075,34 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
         return;
     }
 
+    Time pacingDelay(0);
+    ExamineCtpDataPacket(packet, headers, inPort, static_cast<uint32_t>(outPort), &pacingDelay);
+    if (!pacingDelay.IsZero()) {
+        Simulator::Schedule(pacingDelay,
+                            &UbSwitch::SendPacket,
+                            this,
+                            packet,
+                            inPort,
+                            static_cast<uint32_t>(outPort),
+                            static_cast<uint32_t>(priority));
+        return;
+    }
+
     SendPacket(packet, inPort, outPort, priority);
+}
+
+void
+UbSwitch::ExamineCtpDataPacket(Ptr<Packet> packet,
+                               const ParsedCtpHeaders& headers,
+                               uint32_t inPort,
+                               uint32_t outPort,
+                               Time* pacingDelay)
+{
+    (void)packet;
+    (void)headers;
+    (void)inPort;
+    (void)outPort;
+    *pacingDelay = Time(0);
 }
 
 void UbSwitch::ForceShortestPathRouting(Ptr<Packet> packet, const UbDatalinkPacketHeader &parsedHeader)
@@ -1179,6 +1211,17 @@ UbSwitch::ResolveCtpOutput(Ptr<Packet> packet,
     const int outPort = m_routingProcess->GetOutPortAfterFailure(
         rtKey, selectedShortestPath, inPort, hasExplicitDestinationPort || hasCompactEntityId);
 
+    {
+        const uint32_t dbgNode = GetObject<Node>()->GetId();
+        const uint32_t dbgVl = headers.datalinkPacketHeader.GetPacketVL();
+        if ((dbgNode == 6 || dbgNode == 8) && dbgVl == 7)
+        {
+            std::cerr << "[VL7FWD] node" << dbgNode << " in=" << inPort
+                      << " dnode=" << utils::IpToNodeId(Ipv4Address(rtKey.dip))
+                      << " op=" << (uint32_t)headers.ctpHeader.GetTPOpcode()
+                      << " out=" << outPort << std::endl;
+        }
+    }
     if (outPort >= 0 && !selectedShortestPath) {
         ForceShortestPathRouting(packet, headers.datalinkPacketHeader);
     }
@@ -1367,13 +1410,13 @@ UbSwitch::HandleLastAck(Ptr<UbPort> port, Ptr<Packet> packet)
         TraceReliableReroutingLastAck(packet, node->GetId(), port->GetIfIndex(), "lastack_format_rejected");
         return;
     }
-    if (IsCBFCEnable() || IsCBFCSharedEnable())
+    if (IsPortCbfc(port->GetIfIndex()))
     {
         port->GetFlowControl()->OnDataPacketReceived(packet);
     }
     if (message.destinationNode == node->GetId())
     {
-        if (IsCBFCEnable() || IsCBFCSharedEnable())
+        if (IsPortCbfc(port->GetIfIndex()))
         {
             port->GetFlowControl()->OnIngressEnqueued(MakeIngressFlowControlEventContext(
                 packet, nullptr, port->GetIfIndex(), port->GetIfIndex(), 1));
@@ -1911,6 +1954,12 @@ bool UbSwitch::IsPFCEnable()
 {
     return m_flowControlType == FcType::PFC_FIXED || m_flowControlType == FcType::PFC_DYNAMIC ||
            m_flowControlType == FcType::PFC_DYNAMIC_PAPER;
+}
+
+FcType UbSwitch::GetFlowControlTypeForPort(uint32_t portId) const
+{
+    (void)portId;
+    return m_flowControlType;
 }
 
 Ptr<UbQueueManager> UbSwitch::GetQueueManager()

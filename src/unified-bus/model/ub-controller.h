@@ -14,6 +14,7 @@
 #include "protocol/ub-ctp.h"
 #include "ns3/ub-tp-connection-manager.h"
 #include "ns3/ub-transport-channel-manager.h"
+#include "ns3/ub-ssd.h"
 
 namespace utils
 {
@@ -187,6 +188,11 @@ public:
      */
     void CreateUbTransaction();
 
+    /** @brief 创建 ASU 侧 SSD 存储模型（按 Jetty 队列 + WRR + 延迟/带宽）。 */
+    void CreateUbSsd();
+
+    Ptr<UbSsd> GetUbSsd();
+
     void SetTpConnManager(Ptr<TpConnectionManager> conn)
     {
         m_tpConnectionManager = conn;
@@ -240,6 +246,7 @@ public:
     Ptr<UbTransaction> m_transaction; // 事务层
     Ptr<UbLdstEndpoint> m_ldstEndpoint;
     Ptr<UbCtpTransportService> m_ctpTransportService;
+    Ptr<UbSsd> m_ssd;                    // ASU 侧 SSD 存储模型
     CtpPacketTimingCallback m_ctpFirstPacketSendsCallback;
     CtpPacketTimingCallback m_ctpLastPacketAcksCallback;
     // Resource storage

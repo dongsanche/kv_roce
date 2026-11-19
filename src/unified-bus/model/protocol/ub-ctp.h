@@ -3,6 +3,8 @@
 #define UB_CTP_H
 
 #include "ns3/callback.h"
+#include "ns3/data-rate.h"
+#include "ns3/event-id.h"
 #include "ns3/node.h"
 #include "ns3/nstime.h"
 #include "ns3/object.h"
@@ -44,6 +46,25 @@ struct UbCtpCongestionKey
     uint8_t vl{0};
 
     bool operator<(const UbCtpCongestionKey& other) const;
+};
+
+/**
+ * @brief CTP sender-side rate-control state for one {destination Entity, VL}.
+ *
+ * CTP congestion control is coarse-grained: it follows the spec §6.6.2 semantics of a
+ * {destination Entity, VL} granularity rate limiter driven by standalone CNP feedback.
+ */
+struct CtpCongestionState
+{
+    DataRate currentRate;
+    DataRate targetRate;
+    Time nextAvailableSendTime;
+    double alpha{1.0};
+    bool senderStarted{false};
+    uint32_t recoveryEvents{0};
+    uint64_t bytesSinceLastIncrease{0};
+    EventId rateIncreaseEvent;
+    EventId pacingWakeupEvent;
 };
 
 struct UbCtpRoutingPolicy
@@ -293,6 +314,19 @@ class UbCtpTransportService : public Object
                           uint32_t outPort = UINT32_MAX) const;
     void DoDispose() override;
 
+    // --- CTP 拥塞控制（{目的 Entity, VL} 粗粒度，§6.6.2） ---
+    CtpCongestionState& GetOrCreateCongestionState(const UbCtpCongestionKey& key);
+    bool IsCcLimited(const UbCtpCongestionKey& key, uint32_t bytes);
+    void OnSenderDataPacketSent(const UbCtpCongestionKey& key, uint32_t bytes);
+    void OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn);
+    void OnExternalRate(const UbCtpCongestionKey& key, uint64_t rateBps);
+    void SchedulePacingWakeup(const UbCtpCongestionKey& key);
+    DataRate DeriveLineRate() const;
+    uint64_t ClampBitRate(uint64_t bitRate) const;
+    void HandleRateIncreaseTimer(UbCtpCongestionKey key);
+    void SendCnp(const UbCtpEntityKey& key, uint32_t outPort, uint32_t dstPortId);
+    void DrainPendingResponses(UbCtpCongestionKey ccKey, UbCtpEntityKey key);
+
     Ptr<Node> m_node;
     UbLifecycleResourceIdentity m_lifecycleOwner;
     UbTrackedEventSet m_delayedTaAckEvents;
@@ -314,6 +348,21 @@ class UbCtpTransportService : public Object
     std::map<QueueKey, Ptr<UbCtpTxQueue>> m_queues;
     std::set<Ptr<UbCtpTxQueue>> m_registeredQueues;
     std::map<UbCtpCongestionKey, uint32_t> m_congestionSignals;
+    // CTP 拥塞控制状态：按 {目的 Entity, VL} 键值保存发送端速率状态。
+    bool m_ccEnabled{false};
+    DataRate m_lineRate{DataRate("400Gbps")};
+    DataRate m_initialRate{DataRate("400Gbps")};
+    DataRate m_rateAi{DataRate("40Mbps")};
+    DataRate m_rateHai{DataRate("100Mbps")};
+    Time m_rateIncreaseTimer{MicroSeconds(55)};
+    uint64_t m_byteCounterThreshold{10 * 1024 * 1024};
+    uint32_t m_fastRecoveryLimit{5};
+    double m_alphaGain{1.0 / 256.0};
+    Time m_cnpInterval{MicroSeconds(50)};
+    std::map<UbCtpCongestionKey, Time> m_lastCnpSentByKey;
+    std::map<UbCtpCongestionKey, CtpCongestionState> m_congestionStates;
+    std::map<UbCtpCongestionKey, std::queue<Ptr<UbWqeSegment>>> m_pendingResponsesByKey;
+    uint64_t m_nextRecoveryToken{0};
     TracedCallback<uint32_t,
                    uint32_t,
                    uint32_t,

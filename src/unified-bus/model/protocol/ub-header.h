@@ -809,10 +809,13 @@ public:
     uint8_t GetEcn() const;
     void SetLocation(bool location);
     bool GetLocation() const;
+    void SetRateMbps(uint32_t rateMbps);
+    uint32_t GetRateMbps() const;
 
 private:
     uint8_t m_ecn{0};
     bool m_location{false};
+    uint32_t m_rateMbps{0}; //< 0 = no explicit rate; otherwise target rate in Mbit/s.
 
     static const uint32_t totalHeaderSize = 16;
 };

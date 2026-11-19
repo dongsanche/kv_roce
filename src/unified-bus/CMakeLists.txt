@@ -29,6 +29,8 @@ build_lib(
 	model/ub-traffic-gen.cc
 	model/ub-app.cc
     model/ub-controller.cc
+	model/ub-ssd.cc
+	model/ub-dpu.cc
 	model/ub-transport-channel-manager.cc
 	model/ub-ldst-endpoint.cc
 	model/protocol/ub-datalink.cc
@@ -76,6 +78,8 @@ build_lib(
 	model/ub-traffic-gen.h
 	model/ub-app.h
     model/ub-controller.h
+	model/ub-ssd.h
+	model/ub-dpu.h
 	model/ub-transport-channel-manager.h
 	model/ub-ldst-endpoint.h
 	model/protocol/ub-datalink.h

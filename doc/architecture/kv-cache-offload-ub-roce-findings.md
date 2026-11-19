@@ -1,0 +1,436 @@
+# KV Cache 卸载 UB↔RoCE 网关 — 排障与参数结论
+
+本文沉淀 4-ASU → 2-union → 2×1825 → RoCE-switch → NPU 拓扑在 **8:1 超额认购
+（1 个 NPU）下卡死**的根因排查与参数讨论。原始架构见 `kv-cache-offload-ub-roce.md`，
+实施计划见 `kv-cache-offload-ub-roce-implementation-plan.md`。
+
+## 1. 结论速览
+
+| 问题 | 结论 |
+|------|------|
+| 8:1 incast 卡死根因 | UB 侧（union/1825）入口 headroom 默认 64KB，兜不住 CBFC 初始 credit（~1MB）的突发 |
+| 修复 | `HeadroomPerPortBytes` 64KB → **2MB**（2×初始 credit） |
+| DCQCN | 端到端是通的（mark→FECN→CNP→降速），不是卡点 |
+| PFC | 监控 ingress 不是 egress，不需要"看见 egress" |
+| 丢包位置 | union/1825 的 ingress 准入（CBFC 侧），**不是** RoCE switch 的 egress |
+| 重传为何不恢复 | 尾丢不触发 NAK 快传；超时重传又撞满 buffer 再丢 |
+
+## 2. 更正过的关键事实（排查中得出的正确结论）
+
+### 2.1 DCQCN 反馈环是通的
+
+实测（打开 `UB_CONGESTION_CONTROL_TRACE_ENABLE` + 探针）：
+
+1. RoCE switch 打 FECN：627 次（`DcqcnMarkTrace`）。
+2. FECN 标记**确实传到** NPU（709 个标记包，`mode=4 fecn=1`）。
+3. NPU 生成 CNP（`hasSentCnp` 0→1）。
+4. CNP 到达 ASU（28 次 `CNP_RX`），`OnSenderCongestionNotification` 执行降速。
+
+> 早期"FECN 标记丢了 / 不发 CNP"是探针加错分支（只打未标记包）导致的误判，已更正。
+
+### 2.2 PFC 监控 ingress，不监控 egress
+
+PFC（IEEE 802.1Qbb）是**接收端口按优先级监控自己的 ingress（RX）缓冲**，
+越 XOFF 就发 pause。它跟 egress 输出队列没有直接关系。ns3-ub 自己的
+`src/unified-bus/doc/switch-buffer-architecture.md` 也写明：InPort 视图管 PFC，
+OutPort 视图（VOQ+egress）管 DCQCN/ECN。
+
+> 所以"PFC 需要看见 egress 吗"——不需要。正确的表述是"ingress 缓冲有没有正确反映拥塞"。
+
+### 2.3 丢包点在 UB 侧 ingress，不是 RoCE egress
+
+探针统计丢包位置（`RecordRuntimePacketDrop("ingress buffer full")`）：
+
+| 位置 | 次数 |
+|------|------|
+| union（node 4） | 411 |
+| union（node 5） | 253 |
+| 1825（node 6） | 573 |
+| 1825（node 7） | 595 |
+| RoCE switch（node 8） | **0** |
+
+丢包原因是 **"ingress buffer full"（入口准入），不是 "egress queue buffer full"**。
+congestion 下沉到 RoCE switch(8:1) 反压不回来，数据在 union/1825 的 ingress
+共享池里堆，入口准入丢包。
+
+## 3. 根因：headroom 过小
+
+### 3.1 三层缓冲归属（`ub-queue-manager.cc`）
+
+| 缓冲 | 参数 | 归属 | 当前值 |
+|------|------|------|--------|
+| reserve | `ReservePerQueueBytes` | 每个 (port, VL) 队列保底 | 0 |
+| shared | `SharedPoolBytes` | **全交换机共享** | 12MB |
+| headroom | `HeadroomPerPortBytes` | **每个 ingress port 独立**（port 内所有 VL 共享） | 原 64KB → 2MB |
+
+headroom 的 Occupancy 是 `m_hdrmBytes[inPort][priority]` 按 (端口, 优先级) 记账，
+`GetIngressPortOccupancy(inPort)` 把同一 inPort 的所有 VL 相加得到 `portHdrmUsed`，
+判断 `portHdrmUsed + pSize > m_headroomPerPortBytes` 即丢——限值按 port 卡，非全局。
+
+丢包条件（`CheckIngressAdmission`）：
+
+```
+headroom 满（port 内 VL 合计 > HeadroomPerPortBytes）且 shared > xoff → 丢弃
+```
+
+### 3.2 为什么 64KB 会卡、2MB 就好
+
+headroom 要兜的是"发端在反压生效前还能注入的量"。UB 侧是 **CBFC credit 制**：
+
+- 发送端被授予 `CbfcInitCreditCell 6553 × 160B ≈ 1MB` 初始 credit；
+- 在"别再发了"（不再还 credit）生效前，发送端可以**合法地再灌 ~1MB**；
+- 64KB headroom 远小于这 ~1MB 突发 → 直接丢包。
+
+实测（4-ASU 8:1，4MB/流）：
+
+| Headroom | 结果 |
+|----------|------|
+| 64KB（旧默认） | ❌ 卡死 |
+| 512KB | ✅ 完成（557 丢包）|
+| **2MB** | ✅ **0 丢包** |
+
+修复：`scratch/kv-offload-incast/gen_case.py` 的 `HeadroomPerPortBytes "2097152"`。
+
+## 4. 为什么"尾丢"不靠重传恢复（三层因果链）
+
+### 4.1 尾丢不触发 NAK 快传
+
+NAK 快传的触发条件：接收端**先收到后面的包（PSN=N+1），发现中间 N 缺号**，才发 NAK。
+
+"尾丢"丢的是**最新到达的包**（入口准入放不进去），接收端拿到连续前缀 `0..K`，
+只是在等 `K+1`——`K+1` 后面没有包来"揭示这个洞"，所以**没有乱序缺口，不发 NAK**。
+实测 `NAK_RCVD`（ASU 收到 NAK）计数 = **0**。
+
+### 4.2 超时重传（RTO）又逃不出去
+
+RTO 会触发：发送端等不到 `K+1` 的 ACK，超时后重发 `K+1`。但重发的包又被同一个
+仍然满着的 buffer 再丢一次，形成：
+
+```
+尾丢 → RTO 超时 → 重传 → 又被丢 → RTO（翻倍）→ 重传 → 又丢 → ...（最多 MaxRetransAttempts=7 后放弃）
+```
+
+根子还是 buffer 一直满：DCQCN 降速和 CBFC credit 反压都有**反馈延迟**，这段空窗里
+发送端仍在灌，headroom 太小兜不住。
+
+### 4.3 headroom 要兜的是 credit，不是 BDP
+
+| 机制 | 发端在反压生效前能灌多少 | headroom 兜的量 |
+|------|--------------------------|-----------------|
+| PFC（RoCE，商用交换机） | 只受 BDP 限制（无 credit，pause 一到就停） | ≈ **BDP**（几十~几百 KB） |
+| CBFC（UB 侧） | 手里有 ~1MB 初始 credit | ≈ **初始 credit（~1MB）** |
+
+- BDP 50KB = 400G × 1μs 的"线上在飞"数据量。
+- CBFC 发端一开始就拿 1MB credit，可合法再灌 1MB，headroom 要兜的是这个。
+- 所以"BDP 50KB 却要 2MB headroom"不矛盾：BDP 管 PFC/线缆在飞，credit 管 CBFC 发端的发送额度。
+
+## 5. 参数讨论小结
+
+| 参数 | 讨论结论 |
+|------|----------|
+| headroom | 每 ingress port 独立（非全局）；UB 侧按 CBFC 初始 credit（~1MB）配，不是 BDP；2MB 合理 |
+| egress 队列 | 真实交换机是几十~几百 KB（不是"几个 MTU"，也不是 512KB 的锅）；调小不解决卡死 |
+| SharedPoolBytes | 全交换机共享的大池子（12MB） |
+| PFC vs DCQCN | PFC 盯 ingress，DCQCN/ECN 盯 egress，分工天然如此 |
+| 模块实现 | union = `UbSwitch`(CBFC)；1825 = `UbGateway1825`(CBFC+PFC)；缓冲账务共用 `UbQueueManager` |
+
+## 6. 走过的弯路（避免再踩）
+
+1. ~~PFC 看不见 egress → bug~~：错。PFC 本就不看 egress，方向整个错。
+2. ~~FECN 标记丢了 / 不发 CNP~~：错。探针加错分支，DCQCN 环是通的。
+3. ~~egress 队列太大（512KB）是根因~~：错。丢包是 ingress buffer full，不是 egress queue full；调小 egress 不解决。
+4. ~~CBFC credit 链卡死~~：错。credit 在正常流动（CONTROL_SEND / CREDIT_RESTORE 各 544 次）。
+
+真正的根因是第 3 节的 **headroom 过小**。
+
+## 7. 结果（headroom 修复后）
+
+- 8:1 incast（4 ASU → 1 NPU，4MB/流）：0 丢包跑通。
+- 混合 VL QoS（VL1 高 / VL7 低）：0 丢包，隔离可观测：
+
+| 优先级 | P50 | P99 |
+|--------|-----|-----|
+| 高（VL 1） | 6346 μs | **6352 μs** |
+| 低（VL 7） | 6515 μs | **6846 μs** |
+
+- 单优先级全扫（priority 1–8，4MB/流）：全部 0 丢包跑通。之前观察到的
+  "priority 3/4 卡死"是同一个 headroom 问题的症状（旧 64KB 下所有优先级都丢包，
+  3/4 的特定时序导致重传未收敛成硬卡），不是独立 bug。
+
+## 8. 架构对齐：总线 union + 1825 流控 + DCQCN 按端口定速
+
+从前几节不丢包后，进一步按真实架构对齐了三处建模语义（详见
+`kv-cache-offload-ub-roce.md` 第 5.1 节）。关键结论：
+
+### 8.1 union 是总线，不是 store-and-forward 交换机
+
+- union 建模为**无损总线**：固定 `forwardDelay=100ns` + CBFC（credit）。
+  不需要新节点类型，`SWITCH` 节点配 `forwardDelay=100ns` + CBFC 即可。
+- 曾尝试把 union 设成 `FlowControl=NONE`（误读"总线=无流控"），结果在 8:1 incast 下
+  首轮突发即打穿 headroom 丢包；改回 CBFC 才无损。**总线 = 低时延(100ns) + 无损(CBFC)**，
+  不是无流控。
+
+### 8.2 1825 的 buffer 控制 1815e 发送速度（credit + pull WQE）
+
+- 1825 有一个接收 buffer（`SharedPoolBytes` + `HeadroomPerPortBytes`），buffer 有空位才授
+  CBFC credit 给 1815e，1815e 拿 credit 才拉 WQE 发数据；buffer 满就停授 credit，1815e 停发。
+- credit 量 = `CbfcInitCreditCell`(6553 cell ≈ 1MB)，headroom 2MB（2× 初始 credit）兜住瞬发
+  来势；已验证 0 丢包。
+- 流控点在**发送端点**：读方向由 1815e（DCQCN + CBFC credit），写方向由 1825。DCQCN 只是速率
+  微调（FECN/CNP→降速），无损本身靠 CBFC credit 保证。
+
+### 8.3 DCQCN 按发送端口定速（不再用全局 fabric 值）
+
+- 原配置 `UbHostDcqcn::LineRate/InitialRate = {fabric_bw}`(=400G) 是错的：1815e/NPU 实为 200G NIC。
+- 新增 GlobalValue `UB_DCQCN_USE_PORT_RATE`（默认 `false`，向后兼容），`UbHostDcqcn::OnTpAttached`
+  在开启时从**发送端口的线速**（topology.csv 里 `SetDataRate` 的值）推导 LineRate/InitialRate：
+  1815e/NPU=200G、1825 RoCE=400G。
+- KV-cache 用例打开该开关（`global UB_DCQCN_USE_PORT_RATE "true"`）；实测 ASU 的 DCQCN 起始速率
+  从 400G 变成 200G，unified-bus 单测保持 PASS（默认关闭，不影响既有测试）。
+
+### 8.4 三态拥塞传导结论（对照）
+
+同一 incast 下三种 1825 语义的实操差异（8MB × 8 流 → 1 NPU）：
+
+| 语义 | PFC pause | 丢包 | 拥塞怎么跨 1825 |
+|------|-----------|------|----------------|
+| 存储转发 | 1903 | 0 | buffer 满度反压穿透（union/ASU credit 掉到 0）|
+| 头翻译(cut-through) | 6 | 8941 | 不反压、靠丢包+重传 |
+| 传输终结 | 397 | 0 | 不跨（两侧独立 DCQCN 域）|
+
+即「存储转发=反压穿透 / 头翻译=丢包穿透 / 传输终结=隔离」，可用 credit 掉深 + PFC 次数 + 丢包数
+三个量分开测。
+## 9. CTP 下的 TT 中继缺口（待修）
+
+切换到 CTP 传输 + TRANSPORT_TERMINATION 后，发现 1825 目前**不是耦合中继**：
+
+- traffic.csv 里 UB 侧读（`1825→ASU`）和 RoCE 侧读（`NPU→1825`）都是 `phase=0`、无
+  `dependOnPhases` 依赖 → 两侧是**两个独立 URMA_READ**。
+- 结果：1815e 的控速（CBFC credit + CTP CNP）只压住了 UB 侧（ASU→1825 这段），
+  RoCE 侧（1825→NPU）从 1825 已有的 buffer 直接回数据、**不等 UB 侧那一读**，照旧线速灌
+  8 条流到 NPU → RoCE switch 出口打爆 → PFC 兜不住 → 丢包。
+
+**修法**：给 `NPU→1825` 的 RoCE 侧读加 `dependOnPhases`，依赖 `1825→ASU` 的 UB 侧读，让
+1825 变成「先读 ASU、再回 NPU」的真中继，1815e 的控速才会沿 credit 链传导到 RoCE 侧。
+
+## 10. CTP 下 TT 模式「route cannot be found」根因与修复
+
+TT + CTP 初次跑通后，RoCE 侧仍有 **54 个丢包**，`First drop reason: route cannot be found`，
+全部集中在 **RoCE switch（node 8）**，且丢的是 **CNP（拥塞通知）包**，不是数据包。
+
+### 10.1 根因链
+
+1. NPU 收到 FECN 标记的读响应数据（1825→NPU）后，按 `m_cnpInterval` 发 CNP 回 1825 降速。
+   此 CNP 由 `UbCtpTransportService::SendCnp` 构建。
+2. `SendCnp` 只写 `NodeIdToCna16(dstNode)`（**通配目的端，无端口**），且不写 `SetLb`
+   （lb 恒为 0）。
+3. CNP 到达 RoCE switch，走 `ResolveCtpOutput` 的 entity 解析分支：
+   `SelectCtpEntityMemberPort(dstEntity, lb=0) = ports[0 % 4]`。
+   TT 模式下 1825 是 UB_DEVICE，默认 entity 1 的 member ports 是**全部 4 个口**（0/1 UB 侧 +
+   2/3 RoCE 侧）；`ports[0]` 是 **UB 侧 port 0**。
+4. RoCE switch 的 `routing_table.csv` 只配了 `dstNode=1825, dstPortId=2/3`（RoCE 侧），
+   **没有 port 0 的路由** → `route cannot be found` 丢包（每侧 27 次，共 54）。
+
+### 10.2 修复
+
+CNP 应回发到**被标记数据包的源端口**（即 1825 的 RoCE 端口 2/3），而非按 entity 通配均衡
+（均衡可能选中 UB 侧端口）。改动很小：
+
+- `SendCnp` 增加 `dstPortId` 入参，`SetDcna` 由 `NodeIdToCna16(dstNode)` 改为
+  `NodeIdToCna16(dstNode, dstPortId)`（`dstPortId == UINT32_MAX` 时保持通配）。
+- 调用点（FECN 处理处）从 `cnaHeader.GetScna()` 解出被标记数据包的源端口，传给 `SendCnp`。
+
+修复后 TT+CTP / SF+CTP / TT+RTP 三个组合均 `Simulation finished`、**0 丢包**，
+unified-bus 单测全绿。
+
+> 教训：TT 模式 1825 的默认 CTP entity 横跨 UB/RoCE 两侧端口，后面任何"按 entity 通配
+> 解析目的端口 + 默认 lb=0"的控制包回发（如 CNP），都会命中 `ports[0]`（UB 侧）而走到
+> 没有路由的一侧。真正的中继应该让 1825 的两侧各自暴露独立 entity，而不是共用一个
+> 全端口 entity。
+
+## 11. CNP 修复后的无损性能（吞吐与突发扫描）
+
+CNP 修复后（§10），4-ASU / 2-union / 2×1825 / 1-NPU（8:1 汇聚）TT+CTP 场景 0 丢包、
+无损，吞吐贴着 200G 出口线速走。
+
+### 11.1 读语义（先对齐模型）
+
+`URMA_READ` = 读事务：请求小、响应大。NPU 发小读命令，ASU 作为**数据发送方**主动把
+数据写回（`READ` → 生成 `READ_RESPONSE`，ub-transaction.cc）。实测不对称度：NPU 出口只发
+~361KB（8 个读请求），回收 33.78MB 数据，约 1:93。TT 模式下这是"两段代理读"：
+`NPU→1825`（RoCE）+ `1825→ASU`（UB），数据 ASU→网关→NPU。
+
+### 11.2 吞吐随突发增大逼近线速
+
+单 200G NPU 出口，8 条读竞争（`--transport-mode CTP --ctp-rate-ai 20Gbps`）：
+
+| kv/读 | 总数据 | makespan | 有效吞吐 | vs 200G |
+|-------|-------|----------|---------|---------|
+| 4MB | 32MB | 1422 µs | 188.8 Gbps | 94.4% |
+| 8MB | 64MB | 2807 µs | 191.2 Gbps | 95.6% |
+| 16MB | 128MB | 5530 µs | 194.2 Gbps | 97.1% |
+| 32MB | 256MB | 10929 µs | 196.5 Gbps | 98.2% |
+| 64MB | 512MB | 21753 µs | 197.4 Gbps | 98.7% |
+
+- **0 丢包**一直到 512MB 总量，重传未触发。
+- 固定开销（读建立、CC 爬升）被大负载摊薄 → 越接近线速。
+- UB 侧 CBFC credit 掉到 ~850KB（初始 ~1MB）就稳住、不到零：**限速由速率差决定，不由
+  突发总量决定**，突发变大只拉长 makespan。
+
+## 12. 拥塞控制分层：DCQCN 只在 RoCE 侧激活，UB 侧只有 credit 窗口
+
+开 `UB_CONGESTION_CONTROL_TRACE_ENABLE`（4MB 场景）：
+
+| 位置 | FECN 标记 | CNP |
+|------|----------|-----|
+| RoCE switch → NPU（8:1 瓶颈） | **3732 次** | NPU→网关 75 个 |
+| union → 网关（UB 侧） | **1 次** | 网关→ASU ~1 个 |
+
+- **RoCE 侧才是 DCQCN 主战场**：200G 出口打满 → switch 打 3732 次 FECN → NPU 发 75 个
+  CNP → 网关降速。
+- **UB 侧没有拥塞可标**：网关 16MB buffer 把 ASU 突发整个吃掉，union→网关队列几乎从没
+  超过 Kmin，DCQCN 不启动。
+- 所以 UB 侧看到的 credit 降到 ~850KB **不是"拥塞反压"**，是 credit 窗口的正常在途限制
+  （ASU 想发 400G，网关只能 ~100G 吐）。TT 模式 proxy 的 buffer 把两个拥塞域"完全隔断"
+  （§6.4），UB 域无拥塞、RoCE 域才是 DCQCN+PFC 叠加。
+
+## 13. 受害流（HOL 阻塞）验证：多 incast 场景
+
+### 13.1 credit 真实粒度是 NL，比 VL 更粗
+
+`ub-cbfc.h`：CBFC credit 按 **NL（网络通道）** 记账，`UB_VL_PER_NL=2` 即 2 个 VL 共用一个
+信用池，"exhausting that pool blocks every VL in the group together"。受害流的成立条件：
+**同一信用池（或同一 priority）里的两条流 → 去不同目的地 → 只有一个拥塞**。单 NPU 拓扑
+（所有流同汇一个口）不满足，所以 §11 里看不到受害流。
+
+### 13.2 多 incast 场景（`--workload multi-incast`）
+
+给 `gen_case.py` 新增 `--workload multi-incast`：NPU0 读 `ASU1..N`（incast），其余每个 NPU
+只读 `ASU0`（专属无辜源）。用 `--asu-bw 100Gbps --fabric-bw 400Gbps` 把网关逼成**单 RoCE
+口**，让所有流共享同一条 400G 链路，ECMP 不打散。
+
+场景：4 ASU(100G) → union → 网关(400G 单口) → switch → NPU0/NPU1(各 200G)。
+NPU0 读 ASU1/2/3（incast 300G→200G），NPU1 读 ASU0（专属源、无辜）。`--pri-high 1
+--pri-low 1` 让四流同 priority。
+
+### 13.3 结果与三层分解（如何分辨受害 vs 带宽竞争）
+
+分辨方法：**baseline 定参考 + 量链路利用率判是否真打满 + 换 priority 做 A/B 拆层**。
+
+| 场景 | NPU1 读 4MB 完成时间 | 增量 |
+|------|--------------------|------|
+| 受害流单独（baseline） | 338.6 µs | — |
+| +incast，受害流换 pri7 | 436.2 µs | +97.6 µs |
+| +incast，受害流同 pri1 | 504.5 µs | +165.9 µs |
+
+链路利用率实测：共享 400G 链路只跑 **248 Gbps（62%，有空闲）**，受害专属源 ASU0 被压到
+**67 Gbps（低于自身 100G）** → 不是"公平带宽竞争"（那要链路打满、源不亏），是纯反压。
+
+三层分解：
+
+- **+97.6 µs（pri7 那段）**：CBFC 反压穿过网关 buffer——网关 RoCE 侧被 incast 堵 → buffer
+  涨 → UB 侧停授 credit → 专属源 ASU0 也被压慢。**不看 priority**（与网关 buffer 共享有关）。
+- **+68.3 µs（pri1 比 pri7 多）**：RoCE 侧 **PFC 按 priority 的 HOL**。
+
+结论：单 NPU 拓扑没受害流，多 incast 拓扑有；粗粒度（per-NL credit + per-priority PFC）
+反压确实伤及无辜流，priority 隔离只能减轻（+68µs 可被消掉）、不能根除（+97µs 的网关
+buffer 穿孔反压仍在）。
+
+### 13.4 新增产物
+
+- `scratch/kv-offload-incast/gen_case.py`：新增 `--workload multi-incast` 分支
+  （`targets = asu_ids[1:] if npu_idx == 0 else [asu_ids[0]]`）。
+- 复现命令：
+  `python3 scratch/kv-offload-incast/gen_case.py --output-dir <CASE> --asu-count 4 --npu-count 2
+  --union-count 1 --asu-bw 100Gbps --fabric-bw 400Gbps --gateway-mode STORE_AND_FORWARD
+  --transport-mode CTP --ctp-rate-ai 20Gbps --kv-bytes 4MB --workload multi-incast --pri-high 1 --pri-low 1`
+
+---
+
+> 以下第 14–16 节是迁移到最新 open-usim `ns-3-ub` 后新增的内容。迁移时移除了
+> 旧实现的污染项：`UbGateway1825`（双流控网关）、`relay`/`CQE`/`per-NL(UB_VL_PER_NL)`、
+> `union-marking-scope`、`tt_mode`、`UB_DCQCN_USE_PORT_RATE` 等，相关旧结论（§5 的
+> `UbGateway1825`、§13 的 `UB_VL_PER_NL`、§8.3 的 `UB_DCQCN_USE_PORT_RATE`）不再适用。
+
+## 14. victim 流饿死：多优先级下低优先 VL 被 SP + PFC 全局阈值双重饿死
+
+### 14.1 现象
+
+`--workload multi-incast --pri-high 1 --pri-low 7`（NPU0 高优先读 ASU0/1/2，NPU1 低优先读 ASU3）
+下，低优先 victim（VL7）的 response 收不到，读不完成、request 反复重传。早期现象被
+误判成多个根因（详见 §14.5），最终用日志逐跳定位才钉死。
+
+### 14.2 真实根因（数据钉死）
+
+1. **DPU 出口 SP 调度饿死 VL7**：victim 的 544 个 response 到 DPU6 后，`VOQ[port3][VL7]`
+   大部分时间空（源头供给慢），DWRR 没得转。早期误判"DWRR 失衡"——实际 `SEL/SEND`
+   日志显示 VL1/VL7 完全公平交替，deficit 机制正确。
+2. **源头 ASU3 只发 544 个就停**：Jetty inflight 窗口 `m_inflightMax=512`（`ub-function.h`），
+   发了 544 个、只有 34 个到 NPU10、ACK 只回 34 个 → 未 ACK 510 ≈ 512 → 窗口满 → ASU3 停发。
+3. 恶性循环：response 堆 DPU → 到 NPU 少 → ACK 少 → 窗口满 → 源头停发 → 供给断。
+
+### 14.3 根子的根子：UbDpu 错用交换机语义
+
+迁移初期 `UbDpu : public UbSwitch`，继承了交换机的
+`ingress buffer 记账 + VOQ + DWRR 调度 + CBFC credit 反压`。DPU 是网卡，本该
+「UB 口收一个、RoCE 口发一个」直通，结果被套上交换机才有的 buffer 排队，victim 的
+response 在 DPU 内部堆积出不去。
+
+## 15. 修复：DPU 网卡直通 + RoCE 侧 QP（per-flow）
+
+### 15.1 直通转发
+
+`UbSwitch` 加 `DirectForwardCtpDataPacket` 钩子，`UbDpu` override：UB→RoCE 的数据
+直接 `EnqueueToEgress` + `TriggerTransmit`，**跳过 ingress buffer 记账、VOQ、DWRR 调度**；
+转发即 `OnIngressReleased` 释放 UB 侧 CBFC credit。
+
+### 15.2 RoCE 侧 QP = per-flow 队列
+
+`DpuFlowKey{源 ASU, 目的 NPU, VL}` 即一个 QP/TP，`DpuFlowState` 挂 `pending` 队列。
+UB 侧收数据按 flow 入对应 QP 队列再发 RoCE 侧；RoCE→UB 方向（request/CNP）直接透传。
+UB 侧仍按 VL 管理 CBFC credit（per-VL），RoCE 侧按 flow（QP）。
+
+### 15.3 效果
+
+victim 从卡死（137KB）→ 完整 16.9MB，16/16 任务、0 丢包；RTP / CTP 同优先级 /
+RP 多优先级回归全过。
+
+## 16. 另一个真实 bug：node.csv 的 flowControl 列没被解析
+
+### 16.1 现象
+
+方案1（1825 RP）跑多优先级时 588 丢包（`ingress buffer full`），incast 只发 8.85MB
+（应 48MB）。排查发现 RoCE8 的 PFC pause 从没触发（`PFC-EVAL` 全 `pause=false`）。
+
+### 16.2 根因
+
+`gen_case.py` 在 `node.csv` 里写了 `flowControl` 列（RoCE8 = `PFC_DYNAMIC`），但
+`ub-utils.cc` 的节点解析**只读到 `rocePortCount`，没读 `flowControl`**。于是 RoCE8 一直
+是默认 CBFC（不是 PFC），PFC 反压从不生效，incast 满速灌爆 CBFC 的 ingress headroom 丢包。
+
+### 16.3 修复
+
+`NodeEle` / `UbStructuredNodeConfig` 增加 `flowControl` 字段，`CreateNode` 里
+`SetAttribute("FlowControl", ...)`。修复后方案1 立即 0 丢包、16/16。
+
+## 17. 方案1 vs 方案2 性能（PFC 反馈是关键）
+
+两种拥塞方案（详见架构文档 §3）：
+
+- **方案2（CTP CC 端到端）**：FECN 标记 → NPU 发 CNP → ASU 降速（长链路反馈）。
+- **方案1（1825 RP）**：1825 收 PFC/CNP → 按 ASU 流量比例分配 rate → 发带 rate 的 CNP 下发 ASU。
+
+`--dpu-role rp --rp-push --rp-pfc-feedback`（`RpPfcFeedbackEnabled`）切换是否用 PFC 感知。
+实测（multi-incast，pri-low 7，DWRR）：
+
+| 方案 | victim 均值 | incast 均值 |
+|------|------------|------------|
+| 方案2（CTP CC） | 1594 µs | 5096 µs |
+| 方案1 不用 PFC（只靠 CNP） | 1594 µs | 5096 µs |
+| 方案1 用 PFC | **439 µs** | **1296 µs** |
+
+- 方案1 **去掉 PFC 后性能与方案2 完全一致**（都是端到端 CNP 反馈）。
+- 方案1 快 3.6~3.9 倍的全部来源是 **PFC 近距离反馈**（RoCE8 一跳 pause 到 1825，就地分配
+  下发 ASU），不是「集中式分配算法」本身。
+
+即 1825 的价值在「离拥塞点近、能用链路层 PFC 立即感知」，而非「它算 rate 算得多聪明」。

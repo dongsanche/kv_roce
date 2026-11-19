@@ -1940,7 +1940,7 @@ UbTransaction::RunInboundTransaction(uint32_t localTpn,
         auto response = BuildTransactionResponse(localTpn, request,
                                                   *FindTransactionRule(request->GetType()), result);
         if (sink.IsNull())
-            EnqueueInboundTaResponse(localTpn, response);
+            EnqueueInboundTaResponse(localTpn, response, request);
         else
             sink(response);
         ReleasePendingInboundRequest(localTpn);
@@ -2014,13 +2014,54 @@ UbTransaction::BuildTransactionResponse(uint32_t localTpn,
 }
 
 void UbTransaction::EnqueueInboundTaResponse(uint32_t localTpn,
-                                             Ptr<UbWqeSegment> response)
+                                             Ptr<UbWqeSegment> response,
+                                             Ptr<UbWqeSegment> request)
 {
     if (response == nullptr) {
         return;
     }
 
     response->SetTpn(localTpn);
+
+    // ASU SSD gate：读/写出数据或回确认前，先过 SSD（latency + bytes/bandwidth，按 Jetty
+    // 队列 + WRR 串行）。读方向对 READ_RESPONSE 的数据，写方向（简化版）对写事务的完成
+    // 延迟（延迟 ACK）。
+    Ptr<UbController> controller = GetOwnerController();
+    Ptr<UbSsd> ssd = (controller != nullptr) ? controller->GetUbSsd() : nullptr;
+    if (ssd != nullptr)
+    {
+        if (response->GetType() == UbTransactionOpcode::READ_RESPONSE)
+        {
+            const uint32_t jettyNum = response->GetJettyNum();
+            const uint32_t taskId = response->GetTaskId();
+            const auto last = m_lastSsdTaskIdByJetty.find(jettyNum);
+            const bool chargeLatency = (last == m_lastSsdTaskIdByJetty.end() || last->second != taskId);
+            m_lastSsdTaskIdByJetty[jettyNum] = taskId;
+            const uint64_t payload = response->GetPayloadBytes();
+            ssd->SubmitRead(
+                jettyNum,
+                payload,
+                MakeCallback(&UbTransaction::EnqueueRemoteRtpWqeSegment, this, localTpn, response),
+                chargeLatency);
+            return;
+        }
+        if (request != nullptr && request->GetType() == UbTransactionOpcode::WRITE)
+        {
+            const uint32_t jettyNum = request->GetJettyNum();
+            const uint32_t taskId = request->GetTaskId();
+            const auto last = m_lastSsdTaskIdByJetty.find(jettyNum);
+            const bool chargeLatency = (last == m_lastSsdTaskIdByJetty.end() || last->second != taskId);
+            m_lastSsdTaskIdByJetty[jettyNum] = taskId;
+            const uint64_t bytes = request->GetPayloadBytes();
+            ssd->SubmitWrite(
+                jettyNum,
+                bytes,
+                MakeCallback(&UbTransaction::EnqueueRemoteRtpWqeSegment, this, localTpn, response),
+                chargeLatency);
+            return;
+        }
+    }
+
     EnqueueRemoteRtpWqeSegment(localTpn, response);
 }
 

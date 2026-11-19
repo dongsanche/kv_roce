@@ -65,6 +65,16 @@ void UbController::CreateUbTransaction()
     m_function->BindTransaction(m_transaction);
 }
 
+void UbController::CreateUbSsd()
+{
+    m_ssd = CreateObject<UbSsd>();
+}
+
+Ptr<UbSsd> UbController::GetUbSsd()
+{
+    return m_ssd;
+}
+
 UbController::~UbController()
 {
     NS_LOG_FUNCTION(this);

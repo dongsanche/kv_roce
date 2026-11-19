@@ -4,6 +4,7 @@
 #include "ns3/ub-next-hop-index.h"
 #include "ns3/ub-rule-routing.h"
 #include "ub-ldst-instance.h"
+#include "ns3/ub-dpu.h"
 
 #include <algorithm>
 #include <array>
@@ -3090,14 +3091,14 @@ void UbUtils::DcqcnCnpNotify(uint32_t nodeId,
 }
 
 void UbUtils::DcqcnSenderStateNotify(uint32_t nodeId,
-                                     uint32_t tpn,
-                                     const std::string& reason,
-                                     double alpha,
-                                     uint64_t currentRateBps,
-                                     uint64_t targetRateBps,
-                                     uint64_t bytesSinceLastIncrease,
-                                     uint32_t timeRecoveryEvents,
-                                     uint32_t byteRecoveryEvents)
+                                      uint32_t tpn,
+                                      const std::string& reason,
+                                      double alpha,
+                                      uint64_t currentRateBps,
+                                      uint64_t targetRateBps,
+                                      uint64_t bytesSinceLastIncrease,
+                                      uint32_t timeRecoveryEvents,
+                                      uint32_t byteRecoveryEvents)
 {
     if (trace_path.empty() || !IsCongestionControlTraceEnabled())
     {
@@ -3118,6 +3119,56 @@ void UbUtils::DcqcnSenderStateNotify(uint32_t nodeId,
                          std::to_string(bytesSinceLastIncrease),
                          std::to_string(timeRecoveryEvents),
                          std::to_string(byteRecoveryEvents)}));
+}
+
+void
+UbUtils::CtpCnpNotify(uint32_t nodeId,
+                      uint32_t dstNodeId,
+                      uint32_t dstEntityId,
+                      uint8_t vl,
+                      const std::string& action)
+{
+    if (trace_path.empty() || !IsCongestionControlTraceEnabled())
+    {
+        return;
+    }
+    string fileName = trace_path + "runlog/CtpCnpTrace_node_" + to_string(nodeId) + ".csv";
+    AppendCsvRow(fileName,
+                 "time_ps,event,action,dst_node,dst_entity,vl",
+                 CsvRow({std::to_string(Simulator::Now().GetPicoSeconds()),
+                         "CTP CNP",
+                         action,
+                         std::to_string(dstNodeId),
+                         std::to_string(dstEntityId),
+                         std::to_string(static_cast<uint32_t>(vl))}));
+}
+
+void
+UbUtils::CtpSenderStateNotify(uint32_t nodeId,
+                              uint32_t dstNodeId,
+                              uint32_t dstEntityId,
+                              uint8_t vl,
+                              const std::string& reason,
+                              double alpha,
+                              uint64_t currentRateBps)
+{
+    if (trace_path.empty() || !IsCongestionControlTraceEnabled())
+    {
+        return;
+    }
+    string fileName = trace_path + "runlog/CtpSenderTrace_node_" + to_string(nodeId) + ".csv";
+    std::ostringstream alphaValue;
+    alphaValue << std::fixed << std::setprecision(6) << alpha;
+    AppendCsvRow(fileName,
+                 "time_ps,event,reason,dst_node,dst_entity,vl,alpha,current_rate_bps",
+                 CsvRow({std::to_string(Simulator::Now().GetPicoSeconds()),
+                         "CTP SENDER",
+                         reason,
+                         std::to_string(dstNodeId),
+                         std::to_string(dstEntityId),
+                         std::to_string(static_cast<uint32_t>(vl)),
+                         alphaValue.str(),
+                         std::to_string(currentRateBps)}));
 }
 
 void
@@ -3962,6 +4013,8 @@ void UbUtils::CreateNode(const string &filename)
             nodeEle.allocationDelay = GetOptionalCsvField(fields, headerIndex, "allocationDelay");
         }
         nodeEle.systemIdStr = GetOptionalCsvField(fields, headerIndex, "systemId");
+        nodeEle.rocePortCountStr = GetOptionalCsvField(fields, headerIndex, "rocePortCount");
+        nodeEle.flowControlStr = GetOptionalCsvField(fields, headerIndex, "flowControl");
 
         // 解析节点ID（范围 or 单个节点）
         ParseNodeRange(nodeEle.nodeIdStr, nodeEle);
@@ -3979,6 +4032,10 @@ void UbUtils::CreateNode(const string &filename)
             nodeEle.allocationDelay,
             nodeEle.forwardDelay,
             nodeEle.systemIdStr.empty() ? 0 : static_cast<uint32_t>(stoul(nodeEle.systemIdStr)),
+            nodeEle.rocePortCountStr.empty()
+                ? 0
+                : static_cast<uint32_t>(stoul(nodeEle.rocePortCountStr)),
+            nodeEle.flowControlStr,
         });
     }
     CreateNode(nodes);
@@ -3995,7 +4052,8 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
                         "node IDs must be consecutive and continue from the current NodeList");
 
         Ptr<Node> node = CreateObject<Node>(nodeConfig.systemId);
-        Ptr<UbSwitch> sw = CreateObject<UbSwitch>();
+        Ptr<UbSwitch> sw = nodeConfig.nodeType == "DPU" ? Ptr<UbSwitch>(CreateObject<UbDpu>())
+                                                        : CreateObject<UbSwitch>();
         node->AggregateObject(sw);
         Ptr<ns3::UbLdstInstance> ldst = CreateObject<UbLdstInstance>();
         node->AggregateObject(ldst);
@@ -4006,10 +4064,17 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             node->AggregateObject(ubCtrl);
             ubCtrl->CreateUbFunction();
             ubCtrl->CreateUbTransaction();
+            ubCtrl->CreateUbSsd();
             sw->SetNodeType(UB_DEVICE);
         }
         else if (nodeConfig.nodeType == "SWITCH")
         {
+            sw->SetNodeType(UB_SWITCH);
+        }
+        else if (nodeConfig.nodeType == "DPU")
+        {
+            // DPU/网卡：走 UB_SWITCH 的转发路径，但覆盖了 IsCongestionMarkingEnabled=false
+            // 不打断，端口流控按端口侧（UB=CBFC / RoCE=PFC）由 UbDpu 决定。
             sw->SetNodeType(UB_SWITCH);
         }
         else
@@ -4021,6 +4086,21 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             Ptr<UbPort> port = CreateObject<UbPort>();
             port->SetAddress(Mac48Address::Allocate());
             node->AddDevice(port);
+        }
+        if (nodeConfig.nodeType == "DPU")
+        {
+            Ptr<UbDpu> dpu = DynamicCast<UbDpu>(sw);
+            NS_ABORT_MSG_IF(dpu == nullptr, "DPU node must aggregate a UbDpu");
+            const uint32_t firstRocePort = nodeConfig.portCount - nodeConfig.rocePortCount;
+            for (uint32_t portId = 0; portId < nodeConfig.portCount; ++portId)
+            {
+                dpu->SetPortSide(portId, portId >= firstRocePort ? UbDpu::PortSide::ROCE
+                                                                 : UbDpu::PortSide::UB);
+            }
+        }
+        if (!nodeConfig.flowControl.empty())
+        {
+            sw->SetAttribute("FlowControl", StringValue(nodeConfig.flowControl));
         }
         sw->Init();
         auto cc = UbCongestionControl::Create(UB_SWITCH);

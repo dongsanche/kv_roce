@@ -125,6 +125,33 @@ public:
     bool IsCBFCSharedEnable();
     bool IsPFCEnable();
 
+    /**
+     * @brief 某端口的流控类型（默认每个端口都用节点级 m_flowControlType）。
+     *
+     * 独立网卡/DPU 节点（如 UbDpu）可 override 它，让不同端口走不同流控
+     * （UB 侧 CBFC、RoCE 侧 PFC）。
+     */
+    virtual FcType GetFlowControlTypeForPort(uint32_t portId) const;
+
+    bool IsPortCbfc(uint32_t portId) const
+    {
+        const FcType t = GetFlowControlTypeForPort(portId);
+        return t == FcType::CBFC || t == FcType::CBFC_SHARED;
+    }
+    bool IsPortPfc(uint32_t portId) const
+    {
+        const FcType t = GetFlowControlTypeForPort(portId);
+        return t == FcType::PFC_FIXED || t == FcType::PFC_DYNAMIC || t == FcType::PFC_DYNAMIC_PAPER;
+    }
+
+    /**
+     * @brief 是否对经过本节点的数据报文打 FECN/ECN 拥塞标记。
+     *
+     * 交换机默认开启；独立网卡/DPU 节点（如 UbDpu）应关闭——它透明转发，
+     * 不做交换机的端到端拥塞打标。
+     */
+    virtual bool IsCongestionMarkingEnabled() const { return true; }
+
     // Internal/runtime override entry. Current user-facing configuration still comes from
     // network_attribute.txt via ConfigStore; these setters exist for tests and future bridge code.
     void SetReservePerQueueBytes(uint32_t bytes);
@@ -198,8 +225,56 @@ public:
     RoutingKey GetCtpRoutingKeyForTest(Ptr<Packet> packet);
     uint32_t GetVoqPacketCountForTest(uint32_t outPort, uint32_t priority, uint32_t inPort) const;
 
+    /**
+     * @brief Subclass notification: a PFC pause for the given VL arrived on a local port.
+     *
+     * Called by the port's flow-control component when it receives a pause frame. A subclass
+     * (e.g. UbDpu acting as a reaction point) may use this fast, CNP-independent signal to react
+     * immediately to downstream RoCE congestion.
+     */
+    virtual void OnPfcPause(uint32_t portId, uint8_t vl)
+    {
+    }
+
 protected:
     UbPacketType_t GetPacketType(Ptr<Packet> packet);
+
+    /**
+     * @brief Subclass hook on the CTP data-forwarding hot path.
+     *
+     * Called once per forwarded CTP data packet after the output port is resolved and
+     * ingress admission passed, but before the packet is submitted to the VOQ. A subclass
+     * (e.g. UbDpu acting as a RoCE reaction point) may inspect the parsed headers to detect
+     * control packets such as CNP and may request a pacing delay for the data packet.
+     *
+     * @param packet       The forwarded packet (headers already parsed).
+     * @param headers      Parsed CTP headers.
+     * @param inPort       Ingress port index.
+     * @param outPort      Resolved egress port index.
+     * @param pacingDelay  Output: requested pacing delay; leave zero for immediate forwarding.
+     */
+    virtual void ExamineCtpDataPacket(Ptr<Packet> packet,
+                                      const ParsedCtpHeaders& headers,
+                                      uint32_t inPort,
+                                      uint32_t outPort,
+                                      Time* pacingDelay);
+
+    /**
+     * @brief Subclass hook to bypass switch-style buffering/scheduling and forward a CTP data
+     * packet directly to its resolved egress port.
+     *
+     * A NIC-like node (e.g. UbDpu doing UB<->RoCE conversion) returns true and enqueues the
+     * packet straight to the egress device, skipping ingress-buffer accounting, VOQ and the
+     * output allocator. Return false for the normal switch data path.
+     */
+    virtual bool DirectForwardCtpDataPacket(Ptr<Packet> packet,
+                                            const ParsedCtpHeaders& headers,
+                                            uint32_t inPort,
+                                            uint32_t outPort,
+                                            uint32_t priority)
+    {
+        return false;
+    }
 
 private:
     struct BufferOverrideConfig {

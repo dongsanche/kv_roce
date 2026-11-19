@@ -741,64 +741,94 @@ UbSwitchDcqcn::MaybeMarkPacket(uint32_t outPort, Ptr<Packet> p)
 
     UbDatalinkHeader dlHeader;
     p->PeekHeader(dlHeader);
-    if (!dlHeader.IsPacketIpv4Header())
+    const bool isIpv4 = dlHeader.IsPacketIpv4Header();
+    const bool isCna16 =
+        dlHeader.GetConfig() == static_cast<uint8_t>(UbDatalinkHeaderConfig::PACKET_CNA16);
+    if (!isIpv4 && !isCna16)
     {
         return;
     }
 
-    UbDatalinkPacketHeader dlPacketHeader;
-    UbIpBasedNetworkHeader networkHeader;
-    p->RemoveHeader(dlPacketHeader);
-    p->RemoveHeader(networkHeader);
-
-    const auto restoreHeaders = [&]() {
-        p->AddHeader(networkHeader);
-        p->AddHeader(dlPacketHeader);
+    const auto markProbabilityFor = [&](uint64_t occupancy) -> double {
+        if (occupancy <= m_kminBytes)
+        {
+            return 0.0;
+        }
+        if (m_kmaxBytes > m_kminBytes && occupancy <= m_kmaxBytes)
+        {
+            const double occupancySpan = static_cast<double>(m_kmaxBytes - m_kminBytes);
+            return m_pmax * (static_cast<double>(occupancy - m_kminBytes) / occupancySpan);
+        }
+        return 1.0;
     };
 
-    if (networkHeader.GetMode() == DCQCN_FECN_MODE && networkHeader.GetFecn() != 0)
+    if (isIpv4)
+    {
+        UbDatalinkPacketHeader dlPacketHeader;
+        UbIpBasedNetworkHeader networkHeader;
+        p->RemoveHeader(dlPacketHeader);
+        p->RemoveHeader(networkHeader);
+        const auto restoreHeaders = [&]() {
+            p->AddHeader(networkHeader);
+            p->AddHeader(dlPacketHeader);
+        };
+        if (networkHeader.GetMode() == DCQCN_FECN_MODE && networkHeader.GetFecn() != 0)
+        {
+            restoreHeaders();
+            return;
+        }
+        const uint64_t totalQueueOccupancy = GetOutPortBacklogBytes(outPort);
+        const double markProbability = markProbabilityFor(totalQueueOccupancy);
+        if (markProbability <= 0.0 || m_random->GetValue() > markProbability)
+        {
+            restoreHeaders();
+            return;
+        }
+        networkHeader.SetMode(DCQCN_FECN_MODE);
+        networkHeader.SetLocation(false);
+        networkHeader.SetFecn(DCQCN_FECN_LEVEL_MARKED);
+        restoreHeaders();
+        utils::UbUtils::DcqcnMarkNotify(m_switch->GetObject<Node>()->GetId(),
+                                        outPort,
+                                        totalQueueOccupancy,
+                                        markProbability);
+        return;
+    }
+
+    // CNA16 (CTP/LDST) marking: only mark CTP data packets (NLP == CTPH).
+    UbDatalinkPacketHeader dlPacketHeader;
+    UbCna16NetworkHeader cnaHeader;
+    p->RemoveHeader(dlPacketHeader);
+    p->RemoveHeader(cnaHeader);
+    const auto restoreHeaders = [&]() {
+        p->AddHeader(cnaHeader);
+        p->AddHeader(dlPacketHeader);
+    };
+    if (cnaHeader.GetNlp() != UB_CNA_NLP_CTPH)
     {
         restoreHeaders();
         return;
     }
-
+    if (cnaHeader.GetMode() == DCQCN_FECN_MODE && cnaHeader.GetFecn() != 0)
+    {
+        restoreHeaders();
+        return;
+    }
     const uint64_t totalQueueOccupancy = GetOutPortBacklogBytes(outPort);
-    if (totalQueueOccupancy <= m_kminBytes)
+    const double markProbability = markProbabilityFor(totalQueueOccupancy);
+    if (markProbability <= 0.0 || m_random->GetValue() > markProbability)
     {
         restoreHeaders();
         return;
     }
-
-    double markProbability = 1.0;
-    if (m_kmaxBytes > m_kminBytes && totalQueueOccupancy <= m_kmaxBytes)
-    {
-        const double occupancySpan = static_cast<double>(m_kmaxBytes - m_kminBytes);
-        markProbability =
-            m_pmax * (static_cast<double>(totalQueueOccupancy - m_kminBytes) / occupancySpan);
-    }
-
-    if (m_random->GetValue() > markProbability)
-    {
-        restoreHeaders();
-        return;
-    }
-
-    networkHeader.SetMode(DCQCN_FECN_MODE);
-    networkHeader.SetLocation(false);
-    networkHeader.SetFecn(DCQCN_FECN_LEVEL_MARKED);
-
+    cnaHeader.SetMode(DCQCN_FECN_MODE);
+    cnaHeader.SetLocation(false);
+    cnaHeader.SetFecn(DCQCN_FECN_LEVEL_MARKED);
     restoreHeaders();
-
     utils::UbUtils::DcqcnMarkNotify(m_switch->GetObject<Node>()->GetId(),
                                     outPort,
                                     totalQueueOccupancy,
                                     markProbability);
-
-    NS_LOG_DEBUG("[" << GetTypeId().GetName() << "]"
-                     << " outPort=" << outPort
-                     << " totalQueueOccupancy=" << totalQueueOccupancy
-                     << " markProbability=" << markProbability
-                     << " set FECN");
 }
 
 void

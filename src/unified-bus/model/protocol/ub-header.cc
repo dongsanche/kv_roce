@@ -1838,7 +1838,7 @@ UbCnpExtTph::Serialize(Buffer::Iterator start) const
         (static_cast<uint32_t>(m_ecn & 0x3U) << 30) |
         (static_cast<uint32_t>(m_location ? 1U : 0U) << 29);
     i.WriteHtonU32(word0);
-    i.WriteHtonU32(0);
+    i.WriteHtonU32(m_rateMbps);
     i.WriteHtonU32(0);
     i.WriteHtonU32(0);
 }
@@ -1850,7 +1850,7 @@ UbCnpExtTph::Deserialize(Buffer::Iterator start)
     const uint32_t word0 = i.ReadNtohU32();
     m_ecn = static_cast<uint8_t>((word0 >> 30) & 0x3U);
     m_location = ((word0 >> 29) & 0x1U) != 0;
-    i.ReadNtohU32();
+    m_rateMbps = i.ReadNtohU32();
     i.ReadNtohU32();
     i.ReadNtohU32();
     return GetSerializedSize();
@@ -1884,6 +1884,18 @@ bool
 UbCnpExtTph::GetLocation() const
 {
     return m_location;
+}
+
+void
+UbCnpExtTph::SetRateMbps(uint32_t rateMbps)
+{
+    m_rateMbps = rateMbps;
+}
+
+uint32_t
+UbCnpExtTph::GetRateMbps() const
+{
+    return m_rateMbps;
 }
 
 /*
@@ -1979,67 +1991,74 @@ void UbCna16NetworkHeader::SetDcna(uint16_t v)
 void UbCna16NetworkHeader::SetMode(uint8_t m)
 {
     m_mode = m & 0x7;
+    m_ccFields.raw13 = 0;
 }
 
 void UbCna16NetworkHeader::SetLocation(bool loc)
 {
-    switch (m_mode) {
-        case 0b000:
-            m_ccFields.mode0.location = loc;
-            break;
-        case 0b010:
-            m_ccFields.mode2.location = loc;
-            break;
-        case 0b100:
-            m_ccFields.mode4.location = loc;
-            break;
-        default:
-            break;
+    if (m_mode == 0b000 || m_mode == 0b010 || m_mode == 0b100) {
+        if (loc) {
+            m_ccFields.raw13 |= (1 << 12);
+        } else {
+            m_ccFields.raw13 &= ~(1 << 12);
+        }
     }
 }
 
 void UbCna16NetworkHeader::SetEnable(bool en)
 {
     if (m_mode == 0b000) {
-        m_ccFields.mode0.enable = en;
+        if (en) {
+            m_ccFields.raw13 |= (1 << 10);
+        } else {
+            m_ccFields.raw13 &= ~(1 << 10);
+        }
     }
 }
 
 void UbCna16NetworkHeader::SetC(bool c)
 {
     if (m_mode == 0b000) {
-        m_ccFields.mode0.c = c;
+        if (c) {
+            m_ccFields.raw13 |= (1 << 9);
+        } else {
+            m_ccFields.raw13 &= ~(1 << 9);
+        }
     }
 }
 
 void UbCna16NetworkHeader::SetI(bool v)
 {
     if (m_mode == 0b000) {
-        m_ccFields.mode0.i = v;
+        if (v) {
+            m_ccFields.raw13 |= (1 << 8);
+        } else {
+            m_ccFields.raw13 &= ~(1 << 8);
+        }
     }
 }
 
 void UbCna16NetworkHeader::SetHint(uint8_t h)
 {
     if (m_mode == 0b000) {
-        m_ccFields.mode0.hint = h & 0x7F;
+        m_ccFields.raw13 &= ~0xFF;
+        m_ccFields.raw13 |= (h & 0xFF);
     }
 }
 
 void UbCna16NetworkHeader::SetTimestamp(uint16_t ts)
 {
     if (m_mode == 0b010) {
-        m_ccFields.mode2.timestamp = ts & 0x03FF;
+        m_ccFields.raw13 &= ~(0x3FF << 2);
+        m_ccFields.raw13 |= ((ts & 0x3FF) << 2);
     }
 }
 
 void UbCna16NetworkHeader::SetFecn(uint8_t f)
 {
-    f &= 0x3;
-    if (m_mode == 0b010) {
-        m_ccFields.mode2.fecn = f;
-    } else if (m_mode == 0b100) {
-        m_ccFields.mode4.fecn = f;
+    if (m_mode == 0b010 || m_mode == 0b100) {
+        m_ccFields.raw13 &= ~0x03;
+        m_ccFields.raw13 |= (f & 0x03);
     }
 }
 
@@ -2076,50 +2095,41 @@ uint8_t UbCna16NetworkHeader::GetMode() const
 
 bool UbCna16NetworkHeader::GetLocation() const
 {
-    switch (m_mode) {
-        case 0b000:
-            return m_ccFields.mode0.location;
-        case 0b010:
-            return m_ccFields.mode2.location;
-        case 0b100:
-            return m_ccFields.mode4.location;
-        default:
-            return false;
+    if (m_mode == 0b000 || m_mode == 0b010 || m_mode == 0b100) {
+        return (m_ccFields.raw13 & (1 << 12)) != 0;
     }
+    return false;
 }
 
 bool UbCna16NetworkHeader::GetEnable() const
 {
-    return (m_mode == 0b000) ? m_ccFields.mode0.enable : false;
+    return (m_mode == 0b000) ? ((m_ccFields.raw13 & (1 << 10)) != 0) : false;
 }
 
 bool UbCna16NetworkHeader::GetC() const
 {
-    return (m_mode == 0b000) ? m_ccFields.mode0.c : false;
+    return (m_mode == 0b000) ? ((m_ccFields.raw13 & (1 << 9)) != 0) : false;
 }
 
 bool UbCna16NetworkHeader::GetI() const
 {
-    return (m_mode == 0b000) ? m_ccFields.mode0.i : false;
+    return (m_mode == 0b000) ? ((m_ccFields.raw13 & (1 << 8)) != 0) : false;
 }
 
 uint8_t UbCna16NetworkHeader::GetHint() const
 {
-    return (m_mode == 0b000) ? m_ccFields.mode0.hint : 0;
+    return (m_mode == 0b000) ? (m_ccFields.raw13 & 0xFF) : 0;
 }
 
 uint16_t UbCna16NetworkHeader::GetTimestamp() const
 {
-    return (m_mode == 0b010) ? m_ccFields.mode2.timestamp : 0;
+    return (m_mode == 0b010) ? ((m_ccFields.raw13 >> 2) & 0x3FF) : 0;
 }
 
 uint8_t UbCna16NetworkHeader::GetFecn() const
 {
-    if (m_mode == 0b010) {
-        return m_ccFields.mode2.fecn;
-    }
-    if (m_mode == 0b100) {
-        return m_ccFields.mode4.fecn;
+    if (m_mode == 0b010 || m_mode == 0b100) {
+        return m_ccFields.raw13 & 0x03;
     }
     return 0;
 }

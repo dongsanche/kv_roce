@@ -2,6 +2,7 @@
 #include "ns3/ub-pfc.h"
 #include "ns3/ub-port.h"
 #include "ns3/ub-link.h"
+#include "ns3/ub-switch.h"
 #include "ns3/log.h"
 #include "ns3/ub-network-address.h"
 #include "ns3/ub-utils.h"
@@ -276,10 +277,15 @@ bool UbPfc::UpdatePfcStatus(Ptr<Packet> p)
     IntegerValue val;
     g_ub_vl_num.GetValue(val);
     int ubVlNum = val.Get();
+    Ptr<UbSwitch> sw = node->GetObject<UbSwitch>();
     for (int index = 0; index < ubVlNum; index++) {
         if (m_pfcStatus.m_portCredits[index] != port->m_credits[index]) {
+            const uint8_t oldCredit = m_pfcStatus.m_portCredits[index];
             m_pfcStatus.m_portCredits[index] = port->m_credits[index];
             ret = true;
+            if (sw != nullptr && oldCredit > 0 && port->m_credits[index] == 0) {
+                sw->OnPfcPause(m_portId, static_cast<uint8_t>(index));
+            }
         }
     }
 

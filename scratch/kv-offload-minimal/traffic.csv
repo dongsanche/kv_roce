@@ -1,0 +1,5 @@
+taskId,sourceNode,destNode,dataSize(Byte),opType,priority,delay,phaseId,dependOnPhases
+0,2,0,4194304,URMA_READ,7,10ns,0,
+1,2,0,4194304,URMA_READ,7,10ns,0,
+2,2,0,4194304,URMA_READ,7,10ns,0,
+3,2,0,4194304,URMA_READ,7,10ns,0,
