@@ -1583,7 +1583,9 @@ UbTransaction::TerminateRtpTpGroupOperations(const UbLifecycleResourceIdentity& 
         }
         if (!operation->second.awaitingTpSegmentCleanup)
         {
-            CompleteWqeOperation(jettyNum, wqeId, outcome);
+            // Group teardown owns the terminal outcome of every pending member WQE.
+            CompleteWqeOperationForDrain(jettyNum, wqeId, outcome,
+                                         WqeTerminalMode::CONTINUE_ACCEPTED);
         }
         if (discardRetainedSegments)
         {
@@ -2558,6 +2560,9 @@ UbTransaction::FinishWqe(uint32_t jettyNum,
                     "WqeFinish references a stale WQE instance");
     NS_ABORT_MSG_IF(operation == m_operations.end() && wqe->IsLifecycleManaged(),
                     "WqeFinish references an unknown, duplicate, or stale direct WQE");
+    NS_ABORT_MSG_IF(operation != m_operations.end() && outcome == UbWorkOutcome::COMPLETED &&
+                        !operation->second.segments.empty(),
+                    "Successful WQE completion still has unconfirmed segments");
     if (operation != m_operations.end() && operation->second.ctp)
     {
         if (outcome != UbWorkOutcome::COMPLETED &&
@@ -2770,11 +2775,19 @@ UbTransaction::CompleteWqeOperation(uint32_t jettyNum,
                                     uint32_t wqeId,
                                     UbWorkOutcome outcome)
 {
+    Ptr<UbJetty> jetty = GetJetty(jettyNum);
     CompleteWqeOperationForDrain(
         jettyNum,
         wqeId,
         outcome,
         WqeTerminalMode::CONTINUE_ACCEPTED);
+    // Selective failure can close the last ACK-window hole for a fully answered peer.
+    // Its callback can also destroy or replace the Jetty before control returns here.
+    if (jetty != nullptr && m_function != nullptr && GetJetty(jettyNum) == jetty &&
+        GetFunction()->ShouldContinueAcceptedWqes(jettyNum))
+    {
+        jetty->CheckAndRemoveCompletedWqe();
+    }
 }
 
 void

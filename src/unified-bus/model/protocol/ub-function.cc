@@ -1337,8 +1337,7 @@ void UbJetty::CommitWqeSegmentAdmission(Ptr<UbWqeSegment> segment)
         NS_ABORT_MSG_IF(segment->GetRequestTassn() != wqe->GetRequestTassn(),
                         "WQE request identity changed after first segment admission");
     }
-    wqe->SetCanSend(true);
-    wqe->UpdateSentBytes(segment->GetSize());
+    wqe->RecordSegmentAdmission(segment->GetTaSsn(), segment->GetSize());
     IncreaseTaSsnSndNxt();
 }
 
@@ -1738,17 +1737,9 @@ UbJetty::FlushLegacyWqesForDisposal()
 bool UbJetty::IsWqeCompleted(Ptr<UbWqe> wqe)
 {
     NS_LOG_DEBUG(this);
-    if (!wqe) {
-        return false;
-    }
-
-    // 检查WQE的所有分段是否都已确认
-    uint32_t wqeStartSsn = wqe->GetTaSsnStart();
-    uint32_t wqeSsnSize = wqe->GetTaSsnSize();
-    uint32_t wqeEndSsn = wqeStartSsn + wqeSsnSize - 1;
-
-    // 如果WQE的最后一个分段已经被确认，则WQE完成
-    return (wqeEndSsn < m_taSsnSndUna);
+    // Concurrent WQEs can interleave TASSNs. The contiguous ACK frontier must pass
+    // the last segment actually admitted for this WQE.
+    return wqe && wqe->IsSentCompleted() && wqe->GetLastAdmittedTaSsn() < m_taSsnSndUna;
 }
 
 void UbJetty::DoDispose()

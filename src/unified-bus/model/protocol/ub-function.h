@@ -285,6 +285,8 @@ namespace ns3 {
             AdvanceTaSsnForWqeCleanup(taSsns);
         }
         bool ProcessWqeSegmentComplete(uint32_t taSsnFin);
+        /// Finish fully admitted WQEs covered by the contiguous ACK frontier.
+        void CheckAndRemoveCompletedWqe();
         void RightShiftBitset(uint32_t shiftCount);
         bool SetTaSegmentBytes(uint32_t bytes);
         bool SetInflightMax(uint32_t value);
@@ -467,20 +469,6 @@ namespace ns3 {
         UbSlidingBitmapWindow m_ssnAckWindow{UB_JETTY_TASSN_OOO_THRESHOLD}; // 接收维护的bitmap
         Callback<void, uint32_t, uint32_t> m_completionObserver;
         Callback<void, UbWqeCompletion> m_wqeCompletionCallback;
-        // 每个jetty统一编号，单调升，作为WqeSegment的编号统计
-        //   |----ssn5----|------ssn4-------|------ssn3----->
-        //   |----ssn2----|----ssn1---|---startssn0----->
-        //                               taSsnNxt
-        //                                  taSsnUna
-        // wqe.burst_size = 64*1024
-        // m_messages = m_wqeVector
-        // WQE0 = WqeSegment0 + WqeSegment1 + WqeSegment2
-        // WQE1 = WqeSegment3 + WqeSegment4 + ...
-
-        /**
-         * @brief 检查并移除已完成的WQE
-         */
-        void CheckAndRemoveCompletedWqe();
 
         /**
          * @brief 检查指定WQE是否已完成
