@@ -81,6 +81,13 @@ UbApp::GetTypeId(void)
                 BooleanValue(false),
                 MakeBooleanAccessor(&UbApp::m_ctpUseUnboundSourceJetty),
                 MakeBooleanChecker())
+            .AddAttribute("CqeEnabled",
+                          "When true, the CTP requester sends a completion notification (CQE) "
+                          "back to the responder on each URMA READ completion, so the in-network "
+                          "RP can piggyback a rate onto it.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbApp::m_cqeEnabled),
+                          MakeBooleanChecker())
             .AddTraceSource("MemTaskStartsNotify",
                             "MEM Task Starts, taskId",
                             MakeTraceSourceAccessor(&UbApp::m_traceMemTaskStartsNotify),
@@ -311,6 +318,11 @@ UbApp::SendCtpUrmaTraffic(UbTrafficGen::RuntimeTask task)
     NS_ABORT_MSG_IF(submission.status != UbWqeSubmissionStatus::ACCEPTED,
                     "Validated CTP WQE submission failed before transport start");
     service->StartJetty(jetty, jettyKey);
+
+    if (m_cqeEnabled && task.op == UbTrafficGen::RuntimeTaskOp::URMA_READ)
+    {
+        m_readCompletionMeta[task.taskId] = ReadCompletionMeta{task.destNode, task.priority};
+    }
 }
 
 Ptr<UbJetty>
@@ -541,6 +553,23 @@ UbApp::OnTaskCompletedVisible(uint32_t taskId, uint32_t jettyNum)
     WqeTaskCompletesNotify(node->GetId(), jettyNum, taskId);
     NS_LOG_INFO("[APPLICATION INFO] taskId: " << taskId << ",finish time:"
                                               << Simulator::Now().GetNanoSeconds() << "ns");
+    if (m_cqeEnabled && m_transportMode == TransportMode::CTP)
+    {
+        auto metaIt = m_readCompletionMeta.find(taskId);
+        if (metaIt != m_readCompletionMeta.end())
+        {
+            Ptr<UbController> controller = node->GetObject<UbController>();
+            if (controller != nullptr && controller->GetCtpTransportService() != nullptr)
+            {
+                UbCtpEntityKey key{.srcEntityId = m_localEntityId,
+                                   .dstNodeId = metaIt->second.dstNodeId,
+                                   .dstEntityId = m_peerEntityId,
+                                   .vl = metaIt->second.vl};
+                controller->GetCtpTransportService()->SendCompletion(key, UINT32_MAX);
+            }
+            m_readCompletionMeta.erase(metaIt);
+        }
+    }
     if (m_transportMode == TransportMode::RTP)
     {
         Ptr<UbController> controller = node->GetObject<UbController>();

@@ -135,9 +135,17 @@ private:
     bool m_enableTaskScopedJettyDestroy = false;
     bool m_enablePlannedTpConnectionDestroy = false;
 
+    struct ReadCompletionMeta
+    {
+        uint32_t dstNodeId{0};
+        uint8_t vl{0};
+    };
+
     GetTpnRuleT m_getTpnRule = GetTpnRuleT::BY_PEERNODE_PRIORITY;
     RoutingType m_routingType{RoutingType::PER_FLOW_SHORTEST_PATHS};
     bool m_ctpUseUnboundSourceJetty = false;
+    bool m_cqeEnabled{false};
+    std::map<uint32_t, ReadCompletionMeta> m_readCompletionMeta;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint8_t>, uint32_t>
         m_ctpBoundJettyByFullKey;
     std::map<std::tuple<uint32_t, uint32_t, uint8_t>, uint32_t> m_ctpUnboundJettyBySourceEntityVl;

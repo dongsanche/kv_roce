@@ -25,9 +25,9 @@ namespace ns3 {
  * 拥塞控制角色由 CcRole 属性决定：
  * - TRANSPARENT（默认）：纯透明转发，不参与端到端拥塞控制（IsCongestionMarkingEnabled = false），
  *   限速点在上游主机（ASU）的 CTP CC。
- * - RP：DPU 作为 RoCE 反应点（限速点）。它观测下游每个目的 NPU 的可用带宽与上游每条
- *   源 ASU 流的字节需求，按 RpAllocAlgo 选定的算法把带宽分配给各流，并对发往 RoCE 侧的
- *   数据包做 pacing 限速；限速通过 UB 侧 CBFC credit 的反压自然传导给上游 ASU。
+ * - RP：DPU 作为 RoCE 反应点（限速点）。它对每条 {源 ASU, 目的 NPU, VL} 流独立做 AIMD 控速：
+ *   观测该流的 CNP（乘性减）或长时间无拥塞信号（加性增），把算出的 rate 写到 CQE 字段发回
+ *   ASU，ASU 据此调速。拥塞状态按流维护，一条流拥塞不会连累同 NPU 下的其它流。
  */
 class UbDpu : public UbSwitch
 {
@@ -42,13 +42,6 @@ class UbDpu : public UbSwitch
     {
         TRANSPARENT = 0,
         RP = 1,
-    };
-
-    enum class RpAllocAlgo : uint8_t
-    {
-        PROPORTIONAL = 0, // 按需求比例分：rate_i = B * demand_i / sum(demand)
-        MAXMIN = 1,       // max-min 公平：带宽尽量均分，小流先满足
-        WEIGHTED = 2,     // 按 VL 加权比例：低 VL（高优先）权重更高
     };
 
     UbDpu();
@@ -102,50 +95,35 @@ class UbDpu : public UbSwitch
     struct DpuFlowState
     {
         DataRate currentRate{0};
-        DataRate demand{0};
-        uint64_t windowBytes{0};
+        double alpha{1.0};
+        bool congested{false};
         Time nextSendTime{0};
+        Time lastCqeTime{0};
         bool senderStarted{false};
         uint32_t roceOutPort{0};
         std::queue<Ptr<Packet>> pending;
     };
 
-    struct DpuDestState
-    {
-        DataRate availableBandwidth{0};
-        double alpha{1.0};
-        bool congested{false};
-    };
-
     DataRate DeriveRoceLineRate() const;
-    DataRate DeriveNpuLineRate(uint32_t destinationNodeId) const;
     DpuFlowState& GetOrCreateFlowState(const DpuFlowKey& key);
-    DpuDestState& GetOrCreateDestState(uint32_t destinationNodeId);
     void OnCnpSeen(const DpuFlowKey& key);
-    void OnDataPacket(const DpuFlowKey& key, uint32_t bytes);
-    void PushRateToAsu(const DpuFlowKey& key, DataRate rate);
+    void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
     void TrySendQp(const DpuFlowKey& key);
     void RecomputeAllocation();
-    void UpdateDemands();
-    std::vector<DataRate> Allocate(const std::vector<DpuFlowKey>& keys,
-                                   const std::vector<DataRate>& demands,
-                                   DataRate bandwidth) const;
-    uint32_t FlowWeight(const DpuFlowKey& key) const;
 
     CcRole m_ccRole{CcRole::TRANSPARENT};
-    RpAllocAlgo m_rpAllocAlgo{RpAllocAlgo::PROPORTIONAL};
     bool m_rpPushEnabled{false};
     bool m_rpPfcFeedbackEnabled{true};
+    bool m_rpCqeFallbackEnabled{false};
     DataRate m_rpLineRate{"400Gbps"};
     DataRate m_rpInitialRate{"400Gbps"};
     DataRate m_rpRateAi{"100Mbps"};
     Time m_rpUpdateInterval{MicroSeconds(55)};
+    Time m_rpCqeFallbackInterval{MicroSeconds(250)};
     double m_rpAlphaGain{0.00390625};
     uint64_t m_rpBacklogThreshold{65536};
 
     std::map<DpuFlowKey, DpuFlowState> m_flowStates;
-    std::map<uint32_t, DpuDestState> m_destStates;
-    Time m_lastDemandUpdate{0};
     EventId m_allocEvent;
 
     FcType m_ubFlowControlType{FcType::CBFC};

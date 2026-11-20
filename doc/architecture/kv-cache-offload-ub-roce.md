@@ -126,6 +126,20 @@ UB 侧无损与速率控制是两个层次，流控点都在**发送端点**（�
 - 早期 `UbDpu : public UbSwitch` 继承了交换机的 buffer/VOQ/调度，导致 victim 流在 DPU
   内部堆积饿死（findings §14–15）。改成直通后解决。
 
+### 6.6 RP 控速：per-flow AIMD + CQE 携带（方案1）
+
+`--dpu-role rp` 下 DPU 作为 RoCE 反应点，对每条 `{源 ASU, 目的 NPU, VL}` 流独立做 AIMD
+（findings §18）：
+
+- 每条 `DpuFlowState` 独立维护 `currentRate + alpha + congested`；看到该流 CNP → 乘性减，
+  无 CNP → 加性增。CNP 只标记它自己那条流，不再按「目的 NPU 池」连坐。
+- **CQE 携带**（`--cqe`）：`CtpOpcode` 新增 `CTP_CQE`；NPU 读完成发一个带 rate 字段的 CQE
+  回 ASU，DPU 在 RoCE→UB 看到 CQE 把该流 `currentRate` 写进去再发回，ASU 走
+  `OnExternalRate` 限速。RP 模式**不透传 CNP**（吞掉），避免 ASU 的 DCQCN 和 RP 双重降速。
+- 兜底：`RpCqeFallbackEnabled` 对长时间无 CQE 的流补推 rate。
+- **已知 bug（待修）**：直通路径收到包先 `OnIngressReleased` 还 credit、再转发，RoCE egress
+  被 PFC 反压满时丢包（findings §18.4），导致 4MB/8:1 下 `ingress buffer full` 丢包。
+
 ## 7. QoS 模型
 
 - 1825 内部存在多个 QP，映射到若干 VL；每个 port 有 16 个 VL。

@@ -452,6 +452,7 @@ enum class TransportMode : uint8_t {
 enum class CtpOpcode : uint8_t {
     CTP_DATA = 0x0,
     CTP_CNP = 0x1,
+    CTP_CQE = 0x2,
 };
 
 constexpr uint8_t UB_CNA_NLP_CTPH = 0x0;

@@ -51,8 +51,8 @@ default ns3::UbDpu::RoceFlowControl "PFC_DYNAMIC"
 # DPU CC role: TRANSPARENT (pure forwarder, rate control lives on the ASU CTP CC) or RP
 # (the DPU is the RoCE reaction point, paces its RoCE-side egress and backpressures the ASU).
 default ns3::UbDpu::CcRole "{dpu_role}"
-default ns3::UbDpu::RpAllocAlgo "{rp_alloc_algo}"
 default ns3::UbDpu::RpPushEnabled "{rp_push_enabled}"
+default ns3::UbDpu::RpCqeFallbackEnabled "{rp_cqe_fallback_enabled}"
 default ns3::UbTransportChannel::EnableRetrans "true"
 default ns3::UbTransportChannel::BaseRTO "+25600ns"
 default ns3::UbTransportChannel::MaxRetransAttempts "7"
@@ -89,6 +89,7 @@ default ns3::UbSwitchDcqcn::Pmax "0.01"
 
 # UB transport: RTP (default) or CTP (compact, coarse per-dest-Entity/VL CNP rate control)
 default ns3::UbApp::TransportMode "{transport_mode}"
+default ns3::UbApp::CqeEnabled "{cqe_enabled}"
 default ns3::UbCtpTransportService::CcEnabled "{ctp_cc_enabled}"
 default ns3::UbCtpTransportService::CcLineRate "400Gbps"
 default ns3::UbCtpTransportService::CcInitialRate "400Gbps"
@@ -349,12 +350,13 @@ def main(argv):
     p.add_argument("--dpu-role", default="transparent", choices=["transparent", "rp"],
                    help="DPU congestion-control role: transparent (pure forwarder) or rp "
                         "(RoCE reaction point that paces its RoCE egress)")
-    p.add_argument("--rp-alloc-algo", default="proportional",
-                   choices=["proportional", "maxmin", "weighted"],
-                   help="RP bandwidth allocation across flows to the same destination NPU")
     p.add_argument("--rp-push", action="store_true",
                    help="RP actively pushes its per-flow rate back to each source ASU on every "
                         "allocation update")
+    p.add_argument("--cqe", action="store_true",
+                   help="send a CTP completion (CQE) from the NPU to the ASU on each URMA READ "
+                        "completion, so the DPU piggybacks the per-flow rate onto it (use with "
+                        "--dpu-role rp instead of --rp-push)")
     args = p.parse_args(argv)
 
     asu_port_count = args.union_count  # each ASU connects to every union
@@ -543,10 +545,11 @@ def main(argv):
     with open(os.path.join(args.output_dir, "network_attribute.txt"), "w") as f:
         f.write(DEFAULT_NETWORK_ATTRIBUTES.format(fabric_bw=args.fabric_bw,
                                                   transport_mode=args.transport_mode,
+                                                  cqe_enabled="true" if args.cqe else "false",
                                                   vl_scheduler=args.vl_scheduler.upper(),
                                                   dpu_role="TRANSPARENT" if args.dpu_role == "transparent" else "RP",
-                                                  rp_alloc_algo=args.rp_alloc_algo.upper(),
                                                   rp_push_enabled="true" if args.rp_push else "false",
+                                                  rp_cqe_fallback_enabled="true" if args.cqe else "false",
                                                   ctp_rate_ai=args.ctp_rate_ai,
                                                   ctp_cnp_interval=args.ctp_cnp_interval,
                                                   ctp_cc_enabled=cc_flag,

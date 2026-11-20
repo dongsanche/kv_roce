@@ -52,20 +52,26 @@ UbDpu::GetTypeId()
                           MakeEnumAccessor<CcRole>(&UbDpu::m_ccRole),
                           MakeEnumChecker(CcRole::TRANSPARENT, "TRANSPARENT",
                                           CcRole::RP, "RP"))
-            .AddAttribute("RpAllocAlgo",
-                          "Bandwidth allocation algorithm for RP mode across flows to the same "
-                          "destination NPU: PROPORTIONAL, MAXMIN, or WEIGHTED.",
-                          EnumValue(RpAllocAlgo::PROPORTIONAL),
-                          MakeEnumAccessor<RpAllocAlgo>(&UbDpu::m_rpAllocAlgo),
-                          MakeEnumChecker(                                          RpAllocAlgo::PROPORTIONAL, "PROPORTIONAL",
-                                          RpAllocAlgo::MAXMIN, "MAXMIN",
-                                          RpAllocAlgo::WEIGHTED, "WEIGHTED"))
             .AddAttribute("RpPushEnabled",
                           "When true, the RP actively pushes its per-flow rate back to each "
                           "source ASU on every allocation update.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&UbDpu::m_rpPushEnabled),
                           MakeBooleanChecker())
+            .AddAttribute("RpCqeFallbackEnabled",
+                          "When true and RpPushEnabled is false, the RP additionally pushes the "
+                          "per-flow rate to any ASU whose flow has not produced a completion (CQE) "
+                          "for longer than RpCqeFallbackInterval, so stalled flows still receive "
+                          "a rate update.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbDpu::m_rpCqeFallbackEnabled),
+                          MakeBooleanChecker())
+            .AddAttribute("RpCqeFallbackInterval",
+                          "Minimum gap since the last observed CQE before the RP pushes a fallback "
+                          "rate to a flow (only active when RpCqeFallbackEnabled is true).",
+                          TimeValue(MicroSeconds(250)),
+                          MakeTimeAccessor(&UbDpu::m_rpCqeFallbackInterval),
+                          MakeTimeChecker())
             .AddAttribute("RpPfcFeedbackEnabled",
                           "When true, a received PFC pause immediately triggers the RP to "
                           "reallocate and push rates. Set false to rely only on CNP feedback.",
@@ -170,15 +176,6 @@ UbDpu::DeriveRoceLineRate() const
     return best.GetBitRate() == 0 ? m_rpLineRate : best;
 }
 
-DataRate
-UbDpu::DeriveNpuLineRate(uint32_t destinationNodeId) const
-{
-    (void)destinationNodeId;
-    // The DPU does not see the downstream NPU link directly; start from its RoCE line rate
-    // and let CNP feedback shrink the estimate toward the real bottleneck.
-    return DeriveRoceLineRate();
-}
-
 UbDpu::DpuFlowState&
 UbDpu::GetOrCreateFlowState(const DpuFlowKey& key)
 {
@@ -188,21 +185,9 @@ UbDpu::GetOrCreateFlowState(const DpuFlowKey& key)
         DpuFlowState state;
         state.currentRate = m_rpInitialRate;
         state.nextSendTime = Simulator::Now();
+        state.lastCqeTime = Simulator::Now();
         state.senderStarted = true;
         it = m_flowStates.emplace(key, std::move(state)).first;
-    }
-    return it->second;
-}
-
-UbDpu::DpuDestState&
-UbDpu::GetOrCreateDestState(uint32_t destinationNodeId)
-{
-    auto it = m_destStates.find(destinationNodeId);
-    if (it == m_destStates.end())
-    {
-        DpuDestState state;
-        state.availableBandwidth = DeriveNpuLineRate(destinationNodeId);
-        it = m_destStates.emplace(destinationNodeId, std::move(state)).first;
     }
     return it->second;
 }
@@ -210,26 +195,15 @@ UbDpu::GetOrCreateDestState(uint32_t destinationNodeId)
 void
 UbDpu::OnCnpSeen(const DpuFlowKey& key)
 {
-    DpuDestState& dest = GetOrCreateDestState(key.destinationNodeId);
-    const uint64_t line = DeriveNpuLineRate(key.destinationNodeId).GetBitRate();
-    const double cutFactor = 1.0 - dest.alpha / 2.0;
-    double current = dest.availableBandwidth.GetBitRate();
-    const uint64_t next = std::max<uint64_t>(
-        1u, std::min<uint64_t>(static_cast<uint64_t>(current * cutFactor), line));
-    dest.availableBandwidth = DataRate(next);
-    dest.alpha = (1.0 - m_rpAlphaGain) * dest.alpha + m_rpAlphaGain;
-    dest.congested = true;
+    // A CNP is a congestion signal for exactly this {ASU -> NPU, VL} flow. Mark only it (not the
+    // whole destination NPU) so a heavy flow's CNP never drags the victim's rate down. The
+    // periodic pass applies the multiplicative decrease; we do not recompute immediately because
+    // CNPs arrive at the CcCnpInterval and an immediate halving per CNP collapses too fast.
+    GetOrCreateFlowState(key).congested = true;
 }
 
 void
-UbDpu::OnDataPacket(const DpuFlowKey& key, uint32_t bytes)
-{
-    DpuFlowState& flow = GetOrCreateFlowState(key);
-    flow.windowBytes += bytes;
-}
-
-void
-UbDpu::PushRateToAsu(const DpuFlowKey& key, DataRate rate)
+UbDpu::PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode)
 {
     Ptr<Node> node = GetObject<Node>();
     if (node == nullptr)
@@ -254,7 +228,7 @@ UbDpu::PushRateToAsu(const DpuFlowKey& key, DataRate rate)
     packet->AddHeader(upiHeader);
 
     UbCtpHeader ctpHeader;
-    ctpHeader.SetTPOpcode(CtpOpcode::CTP_CNP);
+    ctpHeader.SetTPOpcode(opcode);
     ctpHeader.SetNlp(UB_CTPH_NLP_UPI16_EID40_TAH);
     packet->AddHeader(ctpHeader);
 
@@ -283,215 +257,47 @@ UbDpu::PushRateToAsu(const DpuFlowKey& key, DataRate rate)
     }
 }
 
-uint32_t
-UbDpu::FlowWeight(const DpuFlowKey& key) const
-{
-    // Lower VL (higher priority) gets a larger weight in the WEIGHTED allocator.
-    return std::max<uint32_t>(1u, 16u - std::min<uint32_t>(key.vl, 15u));
-}
-
-void
-UbDpu::UpdateDemands()
-{
-    const Time now = Simulator::Now();
-    if (m_lastDemandUpdate.IsZero())
-    {
-        m_lastDemandUpdate = now;
-        return;
-    }
-    const Time elapsed = now - m_lastDemandUpdate;
-    if (elapsed.IsZero())
-    {
-        return;
-    }
-    const double seconds = elapsed.GetSeconds();
-    for (auto& entry : m_flowStates)
-    {
-        DpuFlowState& flow = entry.second;
-        flow.demand = DataRate(std::max<uint64_t>(
-            1u, static_cast<uint64_t>(static_cast<double>(flow.windowBytes) * 8.0 / seconds)));
-        flow.windowBytes = 0;
-    }
-    m_lastDemandUpdate = now;
-}
-
-std::vector<DataRate>
-UbDpu::Allocate(const std::vector<DpuFlowKey>& keys,
-                const std::vector<DataRate>& demands,
-                DataRate bandwidth) const
-{
-    const std::size_t n = keys.size();
-    std::vector<double> d(n, 0.0);
-    const double bw = static_cast<double>(bandwidth.GetBitRate());
-    for (std::size_t i = 0; i < n; ++i)
-    {
-        d[i] = static_cast<double>(demands[i].GetBitRate());
-    }
-    std::vector<double> r(n, 0.0);
-
-    switch (m_rpAllocAlgo)
-    {
-    case RpAllocAlgo::PROPORTIONAL: {
-        double sum = 0.0;
-        for (double v : d)
-        {
-            sum += v;
-        }
-        if (sum <= 0.0)
-        {
-            for (std::size_t i = 0; i < n; ++i)
-            {
-                r[i] = bw / static_cast<double>(n);
-            }
-            break;
-        }
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            r[i] = bw * d[i] / sum;
-        }
-        break;
-    }
-    case RpAllocAlgo::MAXMIN: {
-        std::vector<bool> saturated(n, false);
-        double remaining = bw;
-        std::size_t unsat = n;
-        for (std::size_t iter = 0; iter < n; ++iter)
-        {
-            if (unsat == 0)
-            {
-                break;
-            }
-            const double share = remaining / static_cast<double>(unsat);
-            bool changed = false;
-            for (std::size_t i = 0; i < n; ++i)
-            {
-                if (saturated[i])
-                {
-                    continue;
-                }
-                if (d[i] <= share)
-                {
-                    r[i] = d[i];
-                    remaining -= d[i];
-                    saturated[i] = true;
-                    --unsat;
-                    changed = true;
-                }
-            }
-            if (!changed)
-            {
-                for (std::size_t i = 0; i < n; ++i)
-                {
-                    if (!saturated[i])
-                    {
-                        r[i] = share;
-                    }
-                }
-                break;
-            }
-        }
-        break;
-    }
-    case RpAllocAlgo::WEIGHTED: {
-        double weightedSum = 0.0;
-        std::vector<double> w(n, 1.0);
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            w[i] = static_cast<double>(FlowWeight(keys[i]));
-            weightedSum += w[i] * d[i];
-        }
-        if (weightedSum <= 0.0)
-        {
-            double wsum = 0.0;
-            for (double v : w)
-            {
-                wsum += v;
-            }
-            for (std::size_t i = 0; i < n; ++i)
-            {
-                r[i] = bw * w[i] / wsum;
-            }
-            break;
-        }
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            r[i] = bw * (w[i] * d[i]) / weightedSum;
-        }
-        break;
-    }
-    }
-
-    std::vector<DataRate> result(n, DataRate(0));
-    for (std::size_t i = 0; i < n; ++i)
-    {
-        result[i] = DataRate(std::max<uint64_t>(1u, static_cast<uint64_t>(r[i])));
-    }
-    return result;
-}
-
 void
 UbDpu::RecomputeAllocation()
 {
-    UpdateDemands();
+    const DataRate line = DeriveRoceLineRate();
+    const uint64_t lineBps = line.GetBitRate();
+    const uint64_t aiBps = m_rpRateAi.GetBitRate();
+    const Time now = Simulator::Now();
 
-    // Collect every destination that has at least one observed flow (whether congested or not),
-    // so uncongested flows such as the victim still get a rate assigned.
-    std::set<uint32_t> destinations;
-    for (const auto& flowEntry : m_flowStates)
+    for (auto& entry : m_flowStates)
     {
-        destinations.insert(flowEntry.first.destinationNodeId);
-    }
+        const DpuFlowKey& key = entry.first;
+        DpuFlowState& flow = entry.second;
 
-    for (uint32_t dst : destinations)
-    {
-        DpuDestState& dest = GetOrCreateDestState(dst);
-        const uint64_t line = DeriveNpuLineRate(dst).GetBitRate();
-        if (dest.congested)
+        const uint64_t cur = flow.currentRate.GetBitRate();
+        uint64_t next = cur;
+        if (flow.congested)
         {
-            const double cutFactor = 1.0 - dest.alpha / 2.0;
-            const uint64_t next = std::max<uint64_t>(
-                1u, std::min<uint64_t>(static_cast<uint64_t>(dest.availableBandwidth.GetBitRate() *
-                                                            cutFactor),
-                                       line));
-            dest.availableBandwidth = DataRate(next);
-            dest.alpha = (1.0 - m_rpAlphaGain) * dest.alpha + m_rpAlphaGain;
+            // Multiplicative decrease on this flow only, so a heavy flow's CNP never drags the
+            // victim's rate down with it.
+            const double cutFactor = 1.0 - flow.alpha / 2.0;
+            next = std::max<uint64_t>(
+                1u, std::min<uint64_t>(static_cast<uint64_t>(static_cast<double>(cur) * cutFactor),
+                                       lineBps));
+            flow.alpha = (1.0 - m_rpAlphaGain) * flow.alpha + m_rpAlphaGain;
         }
         else
         {
-            const uint64_t next =
-                std::min<uint64_t>(dest.availableBandwidth.GetBitRate() + m_rpRateAi.GetBitRate(),
-                                   line);
-            dest.availableBandwidth = DataRate(next);
+            next = std::min<uint64_t>(cur + aiBps, lineBps);
         }
-        dest.congested = false;
-    }
+        flow.currentRate = DataRate(next);
+        flow.congested = false;
 
-    for (uint32_t dst : destinations)
-    {
-        const DataRate bandwidth = GetOrCreateDestState(dst).availableBandwidth;
-        std::vector<DpuFlowKey> keys;
-        std::vector<DataRate> demands;
-        for (const auto& flowEntry : m_flowStates)
+        if (m_rpPushEnabled)
         {
-            if (flowEntry.first.destinationNodeId != dst)
-            {
-                continue;
-            }
-            keys.push_back(flowEntry.first);
-            demands.push_back(flowEntry.second.demand);
+            PushRateToAsu(key, flow.currentRate);
         }
-        if (keys.empty())
+        else if (m_rpCqeFallbackEnabled && now - flow.lastCqeTime >= m_rpCqeFallbackInterval)
         {
-            continue;
-        }
-        const std::vector<DataRate> alloc = Allocate(keys, demands, bandwidth);
-        for (std::size_t i = 0; i < keys.size(); ++i)
-        {
-            m_flowStates[keys[i]].currentRate = alloc[i];
-            if (m_rpPushEnabled)
-            {
-                PushRateToAsu(keys[i], alloc[i]);
-            }
+            // No completion for this flow recently: push its current AIMD rate anyway so a
+            // stalled flow is not left without any rate update.
+            PushRateToAsu(key, flow.currentRate);
         }
     }
 
@@ -509,11 +315,11 @@ UbDpu::OnPfcPause(uint32_t portId, uint8_t vl)
     // Mark every flow at this VL as congested: the RoCE side just paused this VL, which is the
     // fastest CNP-independent congestion signal the DPU can observe.
     bool affected = false;
-    for (const auto& entry : m_flowStates)
+    for (auto& entry : m_flowStates)
     {
         if (entry.first.vl == vl)
         {
-            GetOrCreateDestState(entry.first.destinationNodeId).congested = true;
+            entry.second.congested = true;
             affected = true;
         }
     }
@@ -575,14 +381,50 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
             inDevice->GetFlowControl()->OnIngressReleased(ctx);
         }
 
+        // Start the periodic allocation loop on the first observed data packet, so rate control
+        // works without relying on PFC feedback.
+        if (m_ccRole == CcRole::RP && !m_allocEvent.IsPending())
+        {
+            m_allocEvent =
+                Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RecomputeAllocation, this);
+        }
+
         flow.pending.push(packet);
         TrySendQp(key);
         return true;
     }
 
-    // RoCE→UB 方向（request/CNP 等）：直接透传回 UB 侧。
+    // RoCE→UB 方向（request/CNP/CQE 等）：透传回 UB 侧，并顺带观测控制帧。
     if (IsPortCbfc(outPort))
     {
+        if (m_ccRole == CcRole::RP)
+        {
+            const uint8_t tpOpcode = headers.ctpHeader.GetTPOpcode();
+            if (tpOpcode == static_cast<uint8_t>(CtpOpcode::CTP_CNP))
+            {
+                // The DPU is the reaction point: consume the end-to-end CNP instead of passing
+                // it through, so the ASU's own DCQCN does not cut the rate a second time on top
+                // of the RP's allocation. Mark the {ASU -> NPU} flow congested; the allocator
+                // picks it up on the next periodic pass.
+                OnCnpSeen(DpuFlowKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl});
+                return true;
+            }
+            else if (tpOpcode == static_cast<uint8_t>(CtpOpcode::CTP_CQE))
+            {
+                // Read completion back to the ASU: rewrite the rate field with this flow's
+                // current allocation and forward the updated CQE (the responder rate-limits from
+                // it). Consume the original so only the rate-bearing CQE reaches the ASU.
+                DpuFlowKey key{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
+                auto flowIt = m_flowStates.find(key);
+                if (flowIt != m_flowStates.end())
+                {
+                    flowIt->second.lastCqeTime = Simulator::Now();
+                    PushRateToAsu(key, flowIt->second.currentRate, CtpOpcode::CTP_CQE);
+                }
+                return true;
+            }
+        }
+
         Ptr<UbPort> outDevice = DynamicCast<UbPort>(node->GetDevice(outPort));
         if (outDevice == nullptr)
         {
@@ -637,60 +479,13 @@ UbDpu::ExamineCtpDataPacket(Ptr<Packet> packet,
                             uint32_t outPort,
                             Time* pacingDelay)
 {
+    (void)packet;
+    (void)headers;
+    (void)inPort;
+    (void)outPort;
+    // DPU rate control happens in DirectForwardCtpDataPacket (per-flow AIMD + rate delivery to
+    // the ASU). No egress pacing here; the ASU honors the pushed/CQE-carried rate itself.
     *pacingDelay = Time(0);
-    if (m_ccRole != CcRole::RP || headers.isCna24)
-    {
-        return;
-    }
-
-    const uint8_t vl = headers.datalinkPacketHeader.GetPacketVL();
-    const uint16_t scna = headers.cna16NetworkHeader.GetScna();
-    const uint16_t dcna = headers.cna16NetworkHeader.GetDcna();
-
-    if (headers.ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_CNP))
-    {
-        // CNP travels NPU (scna) -> ASU (dcna). The DPU, as the sender's NIC, is its real
-        // endpoint: record that the {ASU -> NPU} data flow is congested.
-        DpuFlowKey key{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
-        OnCnpSeen(key);
-        return;
-    }
-
-    // Request direction (RoCE -> UB): a read request from an NPU to an ASU. Pre-create the
-    // reverse {ASU -> NPU} response flow so the allocator can assign it a rate even before its
-    // first data packet arrives (breaks the victim starvation deadlock).
-    if (IsRoceSide(inPort) && IsUbSide(outPort))
-    {
-        DpuFlowKey reverse{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
-        GetOrCreateFlowState(reverse);
-        return;
-    }
-
-    if (!IsRoceSide(outPort) || packet == nullptr)
-    {
-        return;
-    }
-
-    DpuFlowKey key{Cna16ToNodeId(scna), Cna16ToNodeId(dcna), vl};
-    OnDataPacket(key, packet->GetSize());
-
-    if (!m_allocEvent.IsPending())
-    {
-        m_allocEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RecomputeAllocation, this);
-    }
-
-    DpuFlowState& flow = GetOrCreateFlowState(key);
-    const Time now = Simulator::Now();
-    Time sendTime = now;
-    if (flow.nextSendTime > now)
-    {
-        sendTime = flow.nextSendTime;
-        *pacingDelay = flow.nextSendTime - now;
-    }
-    const uint64_t rateBps = std::max<uint64_t>(1u, flow.currentRate.GetBitRate());
-    const double seconds =
-        static_cast<double>(packet->GetSize()) * 8.0 / static_cast<double>(rateBps);
-    flow.nextSendTime = sendTime + Seconds(seconds);
 }
 
 void
@@ -698,7 +493,6 @@ UbDpu::DoDispose()
 {
     m_allocEvent.Cancel();
     m_flowStates.clear();
-    m_destStates.clear();
     m_portSides.clear();
     UbSwitch::DoDispose();
 }

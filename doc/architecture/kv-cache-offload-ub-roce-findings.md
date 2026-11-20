@@ -434,3 +434,87 @@ RP 多优先级回归全过。
   下发 ASU），不是「集中式分配算法」本身。
 
 即 1825 的价值在「离拥塞点近、能用链路层 PFC 立即感知」，而非「它算 rate 算得多聪明」。
+
+## 18. 方案1 重做：CNP 死代码 → per-flow 重构 → CQE 携带 → 直通反压 bug
+
+本节记录方案1（1825 RP）在迁移后的一次较大重做，以及重做中暴露出的一个数据面反压 bug。
+时间顺序：先发现 CNP 观测是死代码，再把分配从「目的 NPU 池」改成 per-flow，再落地
+「CQE 携带 rate」，最后在 4MB/8:1 压测时发现直通路径的反压 bug。
+
+### 18.1 CNP 观测是死代码（"方案1 只靠 CNP"从没生效过）
+
+**现象**：`--dpu-role rp --rp-pfc-feedback=false`（只靠 CNP）下，DPU 的 rate 从不变化，
+结果与方案2（端到端 CTP CC）完全一致。
+
+**根因**：`UbDpu::DirectForwardCtpDataPacket` 把所有 CNA16 包（包括 NPU→ASU 方向的 CNP）
+都直接透传（UB↔RoCE 直通），`ExamineCtpDataPacket` 里的 `CTP_CNP → OnCnpSeen` 分支
+**永远走不到**。所以 §17 里「方案1 不用 PFC = 方案2」的真正原因不是「CNP 稀疏」，
+而是 DPU 压根收不到 CNP。
+
+**修复**：把 CNP 观测挪进 `DirectForwardCtpDataPacket` 的 RoCE→UB 透传分支。
+
+### 18.2 分配粒度重构：从「目的 NPU 池」到 per-flow AIMD
+
+**问题**：原实现里 `DpuDestState`（`m_destStates`）按 **目的 NPU 一个带宽池** 记账，
+`OnCnpSeen` 把 flow 级 CNP 映射成「整个 NPU 池砍半」。一条重流的 CNP 会连带把同 NPU
+下的受害流（别的 VL/源）一起压没——与「1825 做 per-flow 控速」的设计目的矛盾。
+
+**修复**：删除 `DpuDestState` / `RpAllocAlgo`（PROPORTIONAL/MAXMIN/WEIGHTED 三选一）。
+每个 `DpuFlowState`（`{源 ASU, 目的 NPU, VL}`）独立维护 `currentRate + alpha + congested`，
+在 `RecomputeAllocation`（55µs）里逐 flow 做 AIMD：
+
+- 该 flow 看到 CNP → 乘性减（`rate *= 1 - alpha/2`）；
+- 无 CNP → 加性增（`rate += RpRateAi`）；
+- clamp 到 RoCE 线速。
+
+CNP 只标记它自己那条 flow，受害流不再被连坐。
+
+### 18.3 CQE 携带 rate（RP 不透传 CNP）
+
+**目标**：CNP 稀疏（`CcCnpInterval` 50µs 下 4MB 一个读只 ~3 个 CNP），改用「读完成 CQE
+（小 IO 下频率高）携带 rate」，不依赖 PFC。
+
+改动：
+
+- `CtpOpcode` 新增 `CTP_CQE = 0x2`（2-bit 字段装得下）。
+- `UbCtpTransportService::SendCompletion`：NPU 读完成（`UbApp::OnTaskCompletedVisible`，
+  `CqeEnabled` 打开）发一个带 `UbCnpExtTph(rate=0)` 的 CQE 回 ASU。
+- DPU 在 RoCE→UB 看到 `CTP_CQE`，把该 flow 的 `currentRate` 写进 CQE rate 字段再发回
+  ASU（`PushRateToAsu(..., CTP_CQE)`），原始 CQE 吞掉。
+- ASU 收到 `CTP_CQE` 解析 rate → `OnExternalRate` 限速。
+- **RP 模式不透传 CNP**（吞掉），避免 ASU 自己的 DCQCN 和 RP 双重降速。
+- 兜底：`RpCqeFallbackEnabled` 下，对超过 `RpCqeFallbackInterval`（默认 250µs）没收到
+  CQE 的 flow 主动补推一次 rate，防止流卡死时收不到 rate 更新。
+
+**1MB 实测**（4 ASU → 1 NPU，CTP）：
+
+| 模式 | incast 重流完成时间 |
+|------|--------------------|
+| transparent（方案2） | 1670 µs |
+| rppush（方案1 + PFC） | 169 µs |
+| cqe（方案1 + CQE 携带） | 169 µs |
+
+cqe 与 rppush 打平、比 transparent 快 ~10×；之前 CNP 双重惩罚导致的过限消失。
+
+### 18.4 DPU 直通反压 bug（4MB / 8:1 丢包，待修）
+
+**现象**：同样 4 ASU / 2 union / 2×1825 / 1 NPU（8:1 汇聚）下，`--kv-bytes 4MB` 有
+**29096 个 `ingress buffer full` 丢包**，任务卡死、exit 超时；1MB 则 0 丢包。
+
+**根因（数据钉死）**：`UbDpu::DirectForwardCtpDataPacket`（UB→RoCE 方向）现在的顺序是：
+
+1. 一收到 ASU 的包，先 `OnIngressReleased` **无条件把 CBFC credit 还给上游**；
+2. 然后才 `flow.pending.push` + `TrySendQp` 转发到 RoCE egress。
+
+当 RoCE egress 被下游 PFC 反压住（egress 队列 `MaxEgressBytes`=512KB 满），
+`EnqueueToEgress` 失败丢包，但 credit 已经还回去 → 上游 ASU 继续灌 → union/1825 的
+ingress buffer（12MB shared + 2MB headroom）被打爆 → `ingress buffer full` 丢包。
+
+即**不是水线/缓冲不够，而是直通路径把反压链切断了**：credit 应该「转发成功才还」，
+现在变成了「收到就还」。PFC/CBFC 水线再低也救不了，因为 DPU 这个网卡在数据面直接丢，
+没把自己的下游拥塞传导到上游。
+
+**待修**：把 credit 归还（`OnIngressReleased`）挪到「真正被 RoCE egress 收下之后」：
+`DirectForward` 收到先 `pending.push` 不还 credit；`TrySendQp` 检查
+`UbEgressQueue::CanEnqueue`，有空间才 enqueue + 还 credit + pop，没空间留在 `pending`；
+并补一个 egress 排空后的重试钩子，否则 pending 里的包没人发。

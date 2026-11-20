@@ -179,6 +179,7 @@ class UbCtpTransportService : public Object
     bool HandleReceivedPacket(Ptr<Packet> packet);
     bool HandleReceivedPacket(Ptr<Packet> packet, uint32_t ingressPortId);
     bool SendSegment(Ptr<UbWqeSegment> segment, const UbCtpEntityKey& key);
+    void SendCompletion(const UbCtpEntityKey& key, uint32_t dstPortId);
     UbCtpPreparationResult PrepareJettyWithResult(Ptr<UbJetty> jetty,
                                                   const UbCtpEntityKey& key);
     bool PrepareJetty(Ptr<UbJetty> jetty, const UbCtpEntityKey& key);
