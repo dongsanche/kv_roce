@@ -46,9 +46,11 @@ flowchart LR
   RoCE 交换机出口与 NPU 入口。
 - UB 侧无损靠 **CBFC credit**，RoCE 侧无损靠 **PFC**。
 
-### 1.1 三方案的信号方向（叠加在拓扑上）
+### 1.1 三方案的信号方向（分三张图，叠加在拓扑上）
 
-实线=数据方向（ASU→NPU，左→右）；虚线=各方案的拥塞反馈方向。
+每张图：实线=数据方向（ASU→NPU，左→右）；虚线=该方案的拥塞反馈方向。
+
+**方案1 · 1825 RP（短环，近拥塞点）**
 
 ```mermaid
 flowchart LR
@@ -57,23 +59,9 @@ flowchart LR
   d["1825-6/7 (UbDpu)<br/>UB↔RoCE 直通+QP"]:::dpu
   r["RoCE 交换机<br/>PFC，8:1 瓶颈"]:::rsw
   n["NPU<br/>收数据"]:::npu
-
   a0 -- "数据(→NPU)" --> u --> d --> r --> n
-
-  r -.->|"S1: PFC/CNP(1跳)"| d
-  d -.->|"S1: rate 下发 ASU"| a0
-
-  n -.->|"S2: CNP"| r
-  r -.->|"S2: 透传"| d
-  d -.->|"S2: CNP → ASU"| a0
-
-  n -.->|"S3①: CNP → 1825 翻译"| d
-  d -.->|"S3①: 按 VL 重发 → ASU"| a0
-  r -.->|"S3②: PFC → 1825 buffer 积压"| d
-  d -.->|"S3②: 扣 credit → union 积压"| u
-  u -.->|"S3②: 打 FECN → 1825"| d
-  d -.->|"S3②: cut-CNP(按 VL) → ASU"| a0
-
+  r -.->|"PFC/CNP(1跳)"| d
+  d -.->|"按 flow 算 rate → ASU"| a0
   classDef asu fill:#fee
   classDef un fill:#efe
   classDef dpu fill:#eef
@@ -81,9 +69,54 @@ flowchart LR
   classDef npu fill:#fee
 ```
 
-- **S1**：RoCE 交换机一跳把 PFC/CNP 给 1825，1825 就地按 flow 算 rate 下发 ASU。
-- **S2**：NPU 的 CNP 经 RoCE 交换机、1825（透传）一路到 ASU，端到端 CTP CC 降速。
-- **S3（c）**：① 1825 把 RoCE 的 CNP 按 VL 翻译重发给 ASU；② 1825 因 RoCE PFC 不排空、buffer 积压并扣 UB credit → union 队列涨、打 FECN → 1825 再按 VL 给 ASU 发 cut-CNP。
+1825 一跳就近感知 RoCE 拥塞 → 就地 per-flow AIMD → rate 下发 ASU。
+
+**方案2 · transparent（长环，端到端 CTP CC）**
+
+```mermaid
+flowchart LR
+  a0["ASU0..3<br/>SSD/1815e"]:::asu
+  u["union0/1<br/>CBFC 无损"]:::un
+  d["1825-6/7 (UbDpu)<br/>UB↔RoCE 直通+QP"]:::dpu
+  r["RoCE 交换机<br/>PFC，8:1 瓶颈"]:::rsw
+  n["NPU<br/>收数据"]:::npu
+  a0 -- "数据(→NPU)" --> u --> d --> r --> n
+  n -.->|"CNP"| r
+  r -.->|"透传"| d
+  d -.->|"CNP → ASU"| a0
+  classDef asu fill:#fee
+  classDef un fill:#efe
+  classDef dpu fill:#eef
+  classDef rsw fill:#fdd
+  classDef npu fill:#fee
+```
+
+NPU 的 CNP 经 RoCE 交换机、1825（透传）一路回 ASU；反馈横跨整条 ASU↔NPU。
+
+**方案3 · graded / c（逐级，两条路径都在）**
+
+```mermaid
+flowchart LR
+  a0["ASU0..3<br/>SSD/1815e"]:::asu
+  u["union0/1<br/>CBFC 无损"]:::un
+  d["1825-6/7 (UbDpu)<br/>UB↔RoCE 直通+QP"]:::dpu
+  r["RoCE 交换机<br/>PFC，8:1 瓶颈"]:::rsw
+  n["NPU<br/>收数据"]:::npu
+  a0 -- "数据(→NPU)" --> u --> d --> r --> n
+  n -.->|"① CNP → 1825 翻译"| d
+  d -.->|"① 按 VL 重发 → ASU"| a0
+  r -.->|"② PFC → 1825 不排空/积压"| d
+  d -.->|"② 扣 credit → union 积压"| u
+  u -.->|"② 打 FECN → 1825"| d
+  d -.->|"② cut-CNP(按 VL) → ASU"| a0
+  classDef asu fill:#fee
+  classDef un fill:#efe
+  classDef dpu fill:#eef
+  classDef rsw fill:#fdd
+  classDef npu fill:#fee
+```
+
+① 1825 把 RoCE 的 CNP 按 VL 翻译重发给 ASU；② 1825 因 PFC 不排空 buffer 积压、扣 UB credit → union 队列涨打 FECN → 1825 再按 VL 给 ASU 发 cut-CNP。
 
 ## 2. 方案2：transparent + 端到端 CTP CC（长链路闭环）
 
