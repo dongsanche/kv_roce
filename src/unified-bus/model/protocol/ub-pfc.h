@@ -71,6 +71,8 @@ public:
     void Init(FcType mode, int32_t portpfcUpThld, int32_t portpfcLowThld, uint32_t nodeId, uint32_t portId);
 
     bool IsFcLimited(Ptr<UbIngressQueue> ingressQ) override;
+    /// @brief True when the given VL is currently PFC-paused (transmit credit is zero).
+    bool IsVlPaused(uint8_t vl) const;
     void OnIngressReleased(const UbFlowControlEventContext& context) override;
     void OnEgressEnqueued(const UbFlowControlEventContext& context) override;
     void OnControlFrameReceived(Ptr<Packet> p) override;

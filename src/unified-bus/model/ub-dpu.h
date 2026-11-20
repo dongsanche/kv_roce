@@ -92,6 +92,12 @@ class UbDpu : public UbSwitch
         }
     };
 
+    struct PendingPacket
+    {
+        Ptr<Packet> packet;
+        uint32_t inPortId{0};
+    };
+
     struct DpuFlowState
     {
         DataRate currentRate{0};
@@ -101,14 +107,16 @@ class UbDpu : public UbSwitch
         Time lastCqeTime{0};
         bool senderStarted{false};
         uint32_t roceOutPort{0};
-        std::queue<Ptr<Packet>> pending;
+        std::queue<PendingPacket> pending;
     };
 
     DataRate DeriveRoceLineRate() const;
     DpuFlowState& GetOrCreateFlowState(const DpuFlowKey& key);
     void OnCnpSeen(const DpuFlowKey& key);
     void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
+    bool IsRoceVlPaused(uint32_t portId, uint8_t vl) const;
     void TrySendQp(const DpuFlowKey& key);
+    void RetryHeldFlows();
     void RecomputeAllocation();
 
     CcRole m_ccRole{CcRole::TRANSPARENT};
@@ -125,6 +133,7 @@ class UbDpu : public UbSwitch
 
     std::map<DpuFlowKey, DpuFlowState> m_flowStates;
     EventId m_allocEvent;
+    EventId m_retryEvent;
 
     FcType m_ubFlowControlType{FcType::CBFC};
     FcType m_roceFlowControlType{FcType::PFC_DYNAMIC_PAPER};

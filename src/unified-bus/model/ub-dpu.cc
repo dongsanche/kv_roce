@@ -5,6 +5,7 @@
 #include "ns3/ub-datalink.h"
 #include "ns3/ub-header.h"
 #include "ns3/ub-network-address.h"
+#include "ns3/ub-pfc.h"
 #include "ns3/ub-port.h"
 #include "ns3/enum.h"
 
@@ -370,17 +371,6 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         DpuFlowState& flow = GetOrCreateFlowState(key);
         flow.roceOutPort = outPort;
 
-        if (IsPortCbfc(inPort))
-        {
-            UbFlowControlEventContext ctx;
-            ctx.packet = packet;
-            ctx.inPortId = inPort;
-            ctx.outPortId = outPort;
-            ctx.priority = priority;
-            ctx.upstreamCreditAlreadyReturned = false;
-            inDevice->GetFlowControl()->OnIngressReleased(ctx);
-        }
-
         // Start the periodic allocation loop on the first observed data packet, so rate control
         // works without relying on PFC feedback.
         if (m_ccRole == CcRole::RP && !m_allocEvent.IsPending())
@@ -389,8 +379,15 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
                 Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RecomputeAllocation, this);
         }
 
-        flow.pending.push(packet);
+        // Hold the packet in the per-flow QP. The UB-side CBFC credit is NOT returned here; it is
+        // returned only once TrySendQp actually forwards the packet to the RoCE egress, so a
+        // PFC-paused / full egress backpressures the upstream ASU instead of dropping.
+        flow.pending.push(PendingPacket{packet, inPort});
         TrySendQp(key);
+        if (!m_retryEvent.IsPending())
+        {
+            m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
+        }
         return true;
     }
 
@@ -458,18 +455,79 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
         return;
     }
 
+    // If the RoCE egress VL is currently PFC-paused, hold the whole QP (no credit returned, so the
+    // upstream ASU is backpressured rather than allowed to keep flooding the switch).
+    if (IsRoceVlPaused(flow.roceOutPort, key.vl))
+    {
+        return;
+    }
+
+    Ptr<UbEgressQueue> egress = outDevice->GetUbQueue();
     const uint64_t rateBps = std::max<uint64_t>(1u, flow.currentRate.GetBitRate());
+    bool sent = false;
     while (!flow.pending.empty())
     {
-        Ptr<Packet> pkt = flow.pending.front();
-        outDevice->EnqueueToEgress(std::make_tuple(flow.roceOutPort, key.vl, pkt));
-        flow.pending.pop();
+        const PendingPacket& front = flow.pending.front();
+        if (egress != nullptr && !egress->CanEnqueue(front.packet->GetSize()))
+        {
+            break; // egress queue byte limit reached: hold, retry later
+        }
+        if (!outDevice->EnqueueToEgress(std::make_tuple(flow.roceOutPort, key.vl, front.packet)))
+        {
+            break; // egress rejected the packet: hold
+        }
 
-        const double seconds = static_cast<double>(pkt->GetSize()) * 8.0 /
-                               static_cast<double>(rateBps);
+        // The packet actually left the NIC toward the RoCE side, so return the UB-side CBFC credit
+        // to the upstream ASU now (this is the point where backpressure is released).
+        Ptr<UbPort> inDevice = DynamicCast<UbPort>(node->GetDevice(front.inPortId));
+        if (inDevice != nullptr && IsPortCbfc(front.inPortId))
+        {
+            UbFlowControlEventContext ctx;
+            ctx.packet = front.packet;
+            ctx.inPortId = front.inPortId;
+            ctx.outPortId = flow.roceOutPort;
+            ctx.priority = key.vl;
+            ctx.upstreamCreditAlreadyReturned = false;
+            inDevice->GetFlowControl()->OnIngressReleased(ctx);
+        }
+
+        const double seconds =
+            static_cast<double>(front.packet->GetSize()) * 8.0 / static_cast<double>(rateBps);
         flow.nextSendTime = Simulator::Now() + Seconds(seconds);
+        flow.pending.pop();
+        sent = true;
     }
-    outDevice->TriggerTransmit();
+    if (sent)
+    {
+        outDevice->TriggerTransmit();
+    }
+}
+
+void
+UbDpu::RetryHeldFlows()
+{
+    for (auto& entry : m_flowStates)
+    {
+        TrySendQp(entry.first);
+    }
+    m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
+}
+
+bool
+UbDpu::IsRoceVlPaused(uint32_t portId, uint8_t vl) const
+{
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr)
+    {
+        return false;
+    }
+    Ptr<UbPort> port = DynamicCast<UbPort>(node->GetDevice(portId));
+    if (port == nullptr)
+    {
+        return false;
+    }
+    Ptr<UbPfc> pfc = DynamicCast<UbPfc>(port->GetFlowControl());
+    return pfc != nullptr && pfc->IsVlPaused(vl);
 }
 
 void
@@ -492,6 +550,7 @@ void
 UbDpu::DoDispose()
 {
     m_allocEvent.Cancel();
+    m_retryEvent.Cancel();
     m_flowStates.clear();
     m_portSides.clear();
     UbSwitch::DoDispose();

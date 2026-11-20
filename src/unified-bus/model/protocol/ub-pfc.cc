@@ -313,6 +313,12 @@ bool UbPfc::UpdatePfcStatus(Ptr<Packet> p)
     return ret;
 }
 
+bool
+UbPfc::IsVlPaused(uint8_t vl) const
+{
+    return vl < m_pfcStatus.m_portCredits.size() && m_pfcStatus.m_portCredits[vl] == 0;
+}
+
 void UbPfc::SendPfc(Ptr<Packet> pfcPacket, uint32_t targetPortId)
 {
     Ptr<Node> node = NodeList::GetNode(m_nodeId);
