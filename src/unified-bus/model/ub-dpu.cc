@@ -53,6 +53,20 @@ UbDpu::GetTypeId()
                           MakeEnumAccessor<CcRole>(&UbDpu::m_ccRole),
                           MakeEnumChecker(CcRole::TRANSPARENT, "TRANSPARENT",
                                           CcRole::RP, "RP"))
+            .AddAttribute("GradedBackpressure",
+                          "When true, the DPU acts as a per-side CC terminus for graded hop-by-hop "
+                          "backpressure: on receiving an FECN-marked ASU->NPU data packet (the union "
+                          "marks it from its own local backlog), the DPU sends a local cut-CNP back "
+                          "to the source ASU, so each hop runs its own local CC.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbDpu::m_gradedBackpressureEnabled),
+                          MakeBooleanChecker())
+            .AddAttribute("GradedCnpInterval",
+                          "Minimum interval between local cut-CNPs sent to one flow when "
+                          "GradedBackpressure is on.",
+                          TimeValue(MicroSeconds(50)),
+                          MakeTimeAccessor(&UbDpu::m_gradedCnpInterval),
+                          MakeTimeChecker())
             .AddAttribute("RpPushEnabled",
                           "When true, the RP actively pushes its per-flow rate back to each "
                           "source ASU on every allocation update.",
@@ -259,6 +273,59 @@ UbDpu::PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode)
 }
 
 void
+UbDpu::SendCutCnp(const DpuFlowKey& key)
+{
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr)
+    {
+        return;
+    }
+
+    // Plain CTP_CNP (no UbCnpExtTph rate carrier): the ASU's CTP CC receives it with rate=0 and
+    // applies the multiplicative decrease (OnCnpReceived). Sent from the DPU on behalf of the
+    // destination NPU (scna=NPU, dcna=ASU) so the ASU's per-{NPU,VL} send rate is cut locally.
+    Ptr<Packet> packet = Create<Packet>();
+
+    UbCompactEidHeader eidHeader;
+    eidHeader.SetSourceEid(1);
+    eidHeader.SetDestinationEid(1);
+    packet->AddHeader(eidHeader);
+
+    UbCompactUpiHeader upiHeader;
+    upiHeader.SetUpi(0);
+    packet->AddHeader(upiHeader);
+
+    UbCtpHeader ctpHeader;
+    ctpHeader.SetTPOpcode(CtpOpcode::CTP_CNP);
+    ctpHeader.SetNlp(UB_CTPH_NLP_UPI16_EID40_TAH);
+    packet->AddHeader(ctpHeader);
+
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(key.destinationNodeId)));
+    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(key.sourceNodeId)));
+    cnaHeader.SetServiceLevel(key.vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_CTPH);
+    packet->AddHeader(cnaHeader);
+
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                key.vl,
+                                key.vl,
+                                RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+
+    for (uint32_t port = 0; port < node->GetNDevices(); ++port)
+    {
+        if (!IsUbSide(port))
+        {
+            continue;
+        }
+        SendPacket(packet->Copy(), port, port, key.vl);
+    }
+}
+
+void
 UbDpu::RecomputeAllocation()
 {
     const DataRate line = DeriveRoceLineRate();
@@ -379,6 +446,20 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
                 Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RecomputeAllocation, this);
         }
 
+        // Graded hop-by-hop backpressure (scheme 3): the union marks FECN on this ASU->NPU data
+        // from its own local backlog; the DPU (as the UB-side receiver) turns that into a local
+        // cut-CNP back to the source ASU, so the ASU's CTP CC slows locally (each hop CC).
+        if (m_gradedBackpressureEnabled && headers.cna16NetworkHeader.GetFecn() != 0)
+        {
+            const Time gradedNow = Simulator::Now();
+            if (flow.lastCutCnpTime.IsZero() ||
+                gradedNow - flow.lastCutCnpTime >= m_gradedCnpInterval)
+            {
+                flow.lastCutCnpTime = gradedNow;
+                SendCutCnp(key);
+            }
+        }
+
         // Hold the packet in the per-flow QP. The UB-side CBFC credit is NOT returned here; it is
         // returned only once TrySendQp actually forwards the packet to the RoCE egress, so a
         // PFC-paused / full egress backpressures the upstream ASU instead of dropping.
@@ -394,6 +475,21 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
     // RoCE→UB 方向（request/CNP/CQE 等）：透传回 UB 侧，并顺带观测控制帧。
     if (IsPortCbfc(outPort))
     {
+        // Scheme 3 (graded hop-by-hop backpressure) ONLY: the DPU terminates the RoCE-domain CNP
+        // at this hop and does NOT forward it to the ASU, so the ASU is driven solely by the
+        // UB-domain local CNP the DPU generates from the union's FECN (no end-to-end CNP leak /
+        // double cut). Gated on GradedBackpressure + TRANSPARENT; schemes 1 (RP) and 2 keep their
+        // default CNP behavior untouched.
+        if (m_gradedBackpressureEnabled && m_ccRole == CcRole::TRANSPARENT &&
+            headers.ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_CNP))
+        {
+            // CTP congestion control is per-VL: translate the RoCE-domain CNP into a per-VL
+            // UB-side CNP and re-emit it to the ASU, so the ASU's CTP CC cuts exactly this VL.
+            // Consume the original (it is not forwarded as-is).
+            SendCutCnp(DpuFlowKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl});
+            return true;
+        }
+
         if (m_ccRole == CcRole::RP)
         {
             const uint8_t tpOpcode = headers.ctpHeader.GetTPOpcode();

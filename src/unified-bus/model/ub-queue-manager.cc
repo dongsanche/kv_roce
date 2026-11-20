@@ -457,6 +457,26 @@ UbQueueManager::GetOutPortQueueBacklogBytes(uint32_t outPort) const
     return m_totalOutPortVoqBufferedBytes[outPort] + GetOutPortEgressBytes(outPort);
 }
 
+uint64_t
+UbQueueManager::GetOutPortNlBacklogBytes(uint32_t outPort, uint32_t nl, uint32_t vlPerNl) const
+{
+    if (outPort >= m_outPortBuffer.size() || vlPerNl == 0)
+    {
+        return 0;
+    }
+    const uint32_t start = nl * vlPerNl;
+    const uint32_t end = std::min<uint32_t>(start + vlPerNl, m_vlNum);
+    uint64_t bytes = 0;
+    for (uint32_t v = start; v < end; ++v)
+    {
+        if (v < m_outPortBuffer[outPort].size())
+        {
+            bytes += m_outPortBuffer[outPort][v];
+        }
+    }
+    return bytes;
+}
+
 // ========== Three-Tier Buffer ==========
 
 bool UbQueueManager::CheckIngressAdmission(uint32_t inPort, uint32_t priority, uint32_t pSize)

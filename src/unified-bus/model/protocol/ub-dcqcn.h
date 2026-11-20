@@ -141,6 +141,10 @@ private:
     uint32_t m_kminBytes{0};
     uint32_t m_kmaxBytes{0};
     double m_pmax{1.0};
+    /// ECN marking granularity: 1 = the whole out-port backlog (VLs aggregated),
+    /// >1 = group this many VLs into one NL and mark by that NL's backlog (union-only DCQCN,
+    /// causes two VLs in the same NL to share the congestion/marking decision).
+    uint32_t m_vlPerNl{1};
 };
 
 } // namespace ns3

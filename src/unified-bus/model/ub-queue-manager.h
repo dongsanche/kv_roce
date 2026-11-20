@@ -191,6 +191,15 @@ public:
 
     /** Queue Backlog: VOQ + egress queued bytes, excluding fixed processing latency. */
     uint64_t GetOutPortQueueBacklogBytes(uint32_t outPort) const;
+
+    /**
+     * @brief NL-grouped out-port VOQ backlog (sum over the VLs in one NL).
+     *
+     * NL = a fixed group of @p vlPerNl consecutive VLs (e.g. 2). Used only for the
+     * union's NL-grained DCQCN ECN marking, where all VLs in the NL share one marking
+     * decision. VOQ bytes only (the egress is a single per-port FIFO and cannot be split).
+     */
+    uint64_t GetOutPortNlBacklogBytes(uint32_t outPort, uint32_t nl, uint32_t vlPerNl) const;
     
     uint32_t GetReservePerQueueBytes() const { return m_reservePerQueueBytes; }
     void SetReservePerQueueBytes(uint32_t size);

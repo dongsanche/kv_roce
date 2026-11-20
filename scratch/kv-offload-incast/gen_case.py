@@ -51,6 +51,7 @@ default ns3::UbDpu::RoceFlowControl "PFC_DYNAMIC"
 # DPU CC role: TRANSPARENT (pure forwarder, rate control lives on the ASU CTP CC) or RP
 # (the DPU is the RoCE reaction point, paces its RoCE-side egress and backpressures the ASU).
 default ns3::UbDpu::CcRole "{dpu_role}"
+default ns3::UbDpu::GradedBackpressure "{graded_bp_enabled}"
 default ns3::UbDpu::RpPushEnabled "{rp_push_enabled}"
 default ns3::UbDpu::RpCqeFallbackEnabled "{rp_cqe_fallback_enabled}"
 default ns3::UbTransportChannel::EnableRetrans "true"
@@ -357,6 +358,10 @@ def main(argv):
                    help="send a CTP completion (CQE) from the NPU to the ASU on each URMA READ "
                         "completion, so the DPU piggybacks the per-flow rate onto it (use with "
                         "--dpu-role rp instead of --rp-push)")
+    p.add_argument("--graded-backpressure", action="store_true",
+                   help="scheme 3: DPU acts as a per-side CC terminus; when the union marks FECN on "
+                        "ASU->NPU data from its local backlog, the DPU sends a local cut-CNP back to "
+                        "the source ASU (per-hop local CC). Use with --dpu-role transparent.")
     args = p.parse_args(argv)
 
     asu_port_count = args.union_count  # each ASU connects to every union
@@ -548,6 +553,7 @@ def main(argv):
                                                   cqe_enabled="true" if args.cqe else "false",
                                                   vl_scheduler=args.vl_scheduler.upper(),
                                                   dpu_role="TRANSPARENT" if args.dpu_role == "transparent" else "RP",
+                                                  graded_bp_enabled="true" if args.graded_backpressure else "false",
                                                   rp_push_enabled="true" if args.rp_push else "false",
                                                   rp_cqe_fallback_enabled="true" if args.cqe else "false",
                                                   ctp_rate_ai=args.ctp_rate_ai,

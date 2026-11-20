@@ -707,7 +707,15 @@ UbSwitchDcqcn::GetTypeId(void)
                           "DCQCN marking probability at KmaxBytes in the RED-ECN linear region.",
                           DoubleValue(0.01),
                           MakeDoubleAccessor(&UbSwitchDcqcn::m_pmax),
-                          MakeDoubleChecker<double>(0.0, 1.0));
+                          MakeDoubleChecker<double>(0.0, 1.0))
+            .AddAttribute("VlPerNl",
+                          "ECN marking granularity. 1 = mark by the whole out-port backlog "
+                          "(VLs aggregated). >1 = group this many VLs into one NL and mark by that "
+                          "NL's backlog, so all VLs in an NL share the congestion/marking decision "
+                          "(union-only DCQCN NL grouping).",
+                          UintegerValue(1),
+                          MakeUintegerAccessor(&UbSwitchDcqcn::m_vlPerNl),
+                          MakeUintegerChecker<uint32_t>(1, 16));
     return tid;
 }
 
@@ -814,7 +822,20 @@ UbSwitchDcqcn::MaybeMarkPacket(uint32_t outPort, Ptr<Packet> p)
         restoreHeaders();
         return;
     }
-    const uint64_t totalQueueOccupancy = GetOutPortBacklogBytes(outPort);
+    uint64_t totalQueueOccupancy = 0;
+    if (m_vlPerNl > 1)
+    {
+        // Union-only NL-grained DCQCN: mark by the NL's aggregate backlog, so every VL in the
+        // NL (e.g. 2 VLs) shares the same congestion/marking decision.
+        const uint32_t vl = dlPacketHeader.GetPacketVL();
+        const uint32_t nl = vl / m_vlPerNl;
+        totalQueueOccupancy =
+            m_switch->GetQueueManager()->GetOutPortNlBacklogBytes(outPort, nl, m_vlPerNl);
+    }
+    else
+    {
+        totalQueueOccupancy = GetOutPortBacklogBytes(outPort);
+    }
     const double markProbability = markProbabilityFor(totalQueueOccupancy);
     if (markProbability <= 0.0 || m_random->GetValue() > markProbability)
     {

@@ -105,6 +105,7 @@ class UbDpu : public UbSwitch
         bool congested{false};
         Time nextSendTime{0};
         Time lastCqeTime{0};
+        Time lastCutCnpTime{0};
         bool senderStarted{false};
         uint32_t roceOutPort{0};
         std::queue<PendingPacket> pending;
@@ -114,12 +115,15 @@ class UbDpu : public UbSwitch
     DpuFlowState& GetOrCreateFlowState(const DpuFlowKey& key);
     void OnCnpSeen(const DpuFlowKey& key);
     void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
+    void SendCutCnp(const DpuFlowKey& key);
     bool IsRoceVlPaused(uint32_t portId, uint8_t vl) const;
     void TrySendQp(const DpuFlowKey& key);
     void RetryHeldFlows();
     void RecomputeAllocation();
 
     CcRole m_ccRole{CcRole::TRANSPARENT};
+    bool m_gradedBackpressureEnabled{false};
+    Time m_gradedCnpInterval{MicroSeconds(50)};
     bool m_rpPushEnabled{false};
     bool m_rpPfcFeedbackEnabled{true};
     bool m_rpCqeFallbackEnabled{false};

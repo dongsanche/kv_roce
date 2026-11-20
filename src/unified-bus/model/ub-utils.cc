@@ -4105,6 +4105,15 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
         sw->Init();
         auto cc = UbCongestionControl::Create(UB_SWITCH);
         cc->OnSwitchAttached(sw);
+        // Union-only DCQCN NL grouping: a CBFC "bus" switch (the union on the UB side) marks ECN
+        // per NL of 2 VLs, so the two VLs in an NL share the congestion/marking decision. RoCE
+        // switches (PFC) and the DPU are left at the default per-port / VL aggregated marking.
+        if (nodeConfig.nodeType == "SWITCH" &&
+            (sw->GetFlowControlTypeForPort(0) == FcType::CBFC ||
+             sw->GetFlowControlTypeForPort(0) == FcType::CBFC_SHARED))
+        {
+            cc->SetAttributeFailSafe("VlPerNl", UintegerValue(2));
+        }
         if (!nodeConfig.forwardDelay.empty())
         {
             sw->SetAttribute("InPortProcessingDelay", StringValue(nodeConfig.forwardDelay));
