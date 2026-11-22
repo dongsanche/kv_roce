@@ -518,3 +518,55 @@ ingress buffer（12MB shared + 2MB headroom）被打爆 → `ingress buffer full
 `DirectForward` 收到先 `pending.push` 不还 credit；`TrySendQp` 检查
 `UbEgressQueue::CanEnqueue`，有空间才 enqueue + 还 credit + pop，没空间留在 `pending`；
 并补一个 egress 排空后的重试钩子，否则 pending 里的包没人发。
+
+## 19. union per-NL「误打标」受控实验：假设被证伪，风暴真因是自打标
+
+背景：union（CBFC 总线交换机）按 NL(2 VL) 聚合打 ECN（`VlPerNl=2`）。此前担心
+「同 NL 内低优 VL 积压会连坐高优 VL」（[NL-MARK] 强制打标时确实 VL6/VL7 一起被标）。
+为干净验证，做了两件事：
+
+1. **union-only 阈值**（`UB_UNION_DCQCN_KMIN/KMAX/PMAX` 三个 GlobalValue，默认与
+   `UbSwitchDcqcn` 一致 5120/204800/0.01）：只改 union 打标灵敏度，RoCE 交换机保持默认，
+   gen_case 用 `--union-kmin/--union-kmax/--union-pmax` 下发。
+2. **DcqcnMarkTrace 增强**：新增 `vl`（被标包所在 VL）和 `vl_backlog_bytes`
+   （NL 内 per-VL 积压，如 `vl6=4124;vl7=0`）两列，直接归因每次 mark。
+
+### 19.1 敏感化风暴复现（RoCE 侧零参与）
+
+s3 + 8MB + `--union-kmin 1024 --union-kmax 8192 --union-pmax 0.1`：union 打标 760 次
+（p 最高 1.0），**RoCE 交换机（node8）无任何打标 trace**，每 ASU 收 330–420 个翻译后
+cut-CNP → 速率乘性崩到亚 1G → makespan 148ms + 1056 丢包。即之前全局调阈值看到的风暴，
+单靠 union 打标即可完整复现。默认值回归：与旧基线逐字节一致（0 丢包）。
+
+### 19.2 同 NL vs 隔离 NL 受控对比：连坐不成立
+
+处理组 `--pri-high 6 --pri-low 7`（VL6/VL7 同处 NL3）vs 对照组 `--pri-high 4`
+（VL4 独占 NL2，VL7 独占 NL3），其余全同：
+
+| 指标 | 同 NL (6,7) | 隔离 NL (4 / 7) |
+|---|---|---|
+| 高优 VL 被标次数 | 355 (vl6) | 376 (vl4) |
+| 低优 VL7 被标次数 | 388 | 381 |
+| 被标时 own backlog min/avg/max | 4124/4124/4124 | 4124/4178/8248 |
+| 被标时 sibling backlog 均值 | ~11B (vl6)；0 (vl7) | 0；0 |
+| own≤1400B（≈空）的 mark 数 | **0** | **0** |
+| 每 ASU CNP 数 | 328–408（各自 VL） | 328–400（各自 VL） |
+| 任务完成时间 | 114–140µs | 114–143µs |
+
+**结论：两组统计不可区分，跨 VL 连坐为 0。** 每次 mark 时被标 VL 自己的 VOQ 就是
+~4124B，兄弟 VL 几乎总是空的（NL 聚合 ≈ own）。机理：SP 调度 + CBFC credit 阻塞轮转
+下，union 出口 VOQ 是「单 VL 独占式」建排（一个 VL 攒到 ~4124B 打标/降速/排空，换下一个），
+两个 VL 的 VOQ 极少同时非空，所以 per-NL(2) 打标 ≡ per-VL 打标。
+
+之前 [NL-MARK] 的「VL6 跟着 VL7 被标」只在强制打标（人为拉满积压）下出现，
+自然 dynamics 不触发。
+
+### 19.3 推论：不存在「只打拥塞 VL」的 Kmin 窗口
+
+所有 VL 共享同一 ~4124B 操作点（credit 周期的吸引子），而默认 Kmin=5120 恰好高于它
+（union 从不打标）。一旦把 Kmin 降到 4124 以下让 union 开始打标，所有 VL 会一起自打标
+（风暴）；不存在只让「拥塞 VL」被打、无辜 VL 幸免的窗口。要按 VL 区分 congestion，
+需 per-VL 阈值/占有率归一化，而不是 NL 聚合或全局 Kmin。
+
+（次要观察：同 NL 组 vl7 own 最大 4124，隔离组可达 24744——mark 随机性导致轨迹分岔，
+不影响归因结论。）

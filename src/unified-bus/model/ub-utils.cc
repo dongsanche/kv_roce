@@ -3051,7 +3051,9 @@ void UbUtils::CbfcControlSendNotify(uint32_t nodeId,
 void UbUtils::DcqcnMarkNotify(uint32_t nodeId,
                               uint32_t outPort,
                               uint64_t totalQueueBytes,
-                              double markProbability)
+                              double markProbability,
+                              uint32_t vl,
+                              const std::string& vlBacklog)
 {
     if (trace_path.empty() || !IsCongestionControlTraceEnabled())
     {
@@ -3061,13 +3063,17 @@ void UbUtils::DcqcnMarkNotify(uint32_t nodeId,
         trace_path + "runlog/DcqcnMarkTrace_node_" + to_string(nodeId) + "_port_" + to_string(outPort) + ".csv";
     std::ostringstream probability;
     probability << std::fixed << std::setprecision(6) << markProbability;
+    const std::string vlStr =
+        vl == std::numeric_limits<uint32_t>::max() ? "" : std::to_string(vl);
     AppendCsvRow(fileName,
-                 "time_ps,event,out_port,total_queue_bytes,mark_probability",
+                 "time_ps,event,out_port,total_queue_bytes,mark_probability,vl,vl_backlog_bytes",
                  CsvRow({std::to_string(Simulator::Now().GetPicoSeconds()),
                          "DCQCN MARK",
                          std::to_string(outPort),
                          std::to_string(totalQueueBytes),
-                         probability.str()}));
+                         probability.str(),
+                         vlStr,
+                         vlBacklog}));
 }
 
 void UbUtils::DcqcnCnpNotify(uint32_t nodeId,

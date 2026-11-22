@@ -477,6 +477,16 @@ UbQueueManager::GetOutPortNlBacklogBytes(uint32_t outPort, uint32_t nl, uint32_t
     return bytes;
 }
 
+uint64_t
+UbQueueManager::GetOutPortVlBacklogBytes(uint32_t outPort, uint32_t vl) const
+{
+    if (outPort >= m_outPortBuffer.size() || vl >= m_outPortBuffer[outPort].size())
+    {
+        return 0;
+    }
+    return m_outPortBuffer[outPort][vl];
+}
+
 // ========== Three-Tier Buffer ==========
 
 bool UbQueueManager::CheckIngressAdmission(uint32_t inPort, uint32_t priority, uint32_t pSize)

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ns3/ub-dcqcn.h"
 
+#include <limits>
+
 #include "ns3/double.h"
 #include "ns3/log.h"
 #include "ns3/random-variable-stream.h"
@@ -823,14 +825,29 @@ UbSwitchDcqcn::MaybeMarkPacket(uint32_t outPort, Ptr<Packet> p)
         return;
     }
     uint64_t totalQueueOccupancy = 0;
+    uint32_t vl = std::numeric_limits<uint32_t>::max();
+    std::string vlBacklog;
     if (m_vlPerNl > 1)
     {
         // Union-only NL-grained DCQCN: mark by the NL's aggregate backlog, so every VL in the
         // NL (e.g. 2 VLs) shares the same congestion/marking decision.
-        const uint32_t vl = dlPacketHeader.GetPacketVL();
+        vl = dlPacketHeader.GetPacketVL();
         const uint32_t nl = vl / m_vlPerNl;
-        totalQueueOccupancy =
-            m_switch->GetQueueManager()->GetOutPortNlBacklogBytes(outPort, nl, m_vlPerNl);
+        const Ptr<UbQueueManager> qm = m_switch->GetQueueManager();
+        totalQueueOccupancy = qm->GetOutPortNlBacklogBytes(outPort, nl, m_vlPerNl);
+        // Per-VL breakdown for attribution: shows which VL owns the backlog that drove the mark
+        // (e.g. an innocent VL marked because a sibling VL in the NL is congested).
+        std::ostringstream breakdown;
+        const uint32_t end = std::min<uint32_t>((nl + 1) * m_vlPerNl, qm->GetVlNum());
+        for (uint32_t v = nl * m_vlPerNl; v < end; ++v)
+        {
+            if (v > nl * m_vlPerNl)
+            {
+                breakdown << ";";
+            }
+            breakdown << "vl" << v << "=" << qm->GetOutPortVlBacklogBytes(outPort, v);
+        }
+        vlBacklog = breakdown.str();
     }
     else
     {
@@ -849,7 +866,9 @@ UbSwitchDcqcn::MaybeMarkPacket(uint32_t outPort, Ptr<Packet> p)
     utils::UbUtils::DcqcnMarkNotify(m_switch->GetObject<Node>()->GetId(),
                                     outPort,
                                     totalQueueOccupancy,
-                                    markProbability);
+                                    markProbability,
+                                    vl,
+                                    vlBacklog);
 }
 
 void

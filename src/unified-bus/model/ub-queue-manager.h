@@ -200,6 +200,16 @@ public:
      * decision. VOQ bytes only (the egress is a single per-port FIFO and cannot be split).
      */
     uint64_t GetOutPortNlBacklogBytes(uint32_t outPort, uint32_t nl, uint32_t vlPerNl) const;
+
+    uint32_t GetVlNum() const { return m_vlNum; }
+
+    /**
+     * @brief Per-VL out-port VOQ backlog (one VL of the out-port VOQ array).
+     *
+     * Companion of GetOutPortNlBacklogBytes for per-VL congestion attribution: lets a
+     * trace show which VL inside an NL actually owns the backlog that drove a mark.
+     */
+    uint64_t GetOutPortVlBacklogBytes(uint32_t outPort, uint32_t vl) const;
     
     uint32_t GetReservePerQueueBytes() const { return m_reservePerQueueBytes; }
     void SetReservePerQueueBytes(uint32_t size);

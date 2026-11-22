@@ -324,7 +324,9 @@ public:
     static void DcqcnMarkNotify(uint32_t nodeId,
                                 uint32_t outPort,
                                 uint64_t totalQueueBytes,
-                                double markProbability);
+                                double markProbability,
+                                uint32_t vl = std::numeric_limits<uint32_t>::max(),
+                                const std::string& vlBacklog = "");
 
     static void DcqcnCnpNotify(uint32_t nodeId,
                                uint32_t tpn,
