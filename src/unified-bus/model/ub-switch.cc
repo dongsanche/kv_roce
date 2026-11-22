@@ -1211,17 +1211,6 @@ UbSwitch::ResolveCtpOutput(Ptr<Packet> packet,
     const int outPort = m_routingProcess->GetOutPortAfterFailure(
         rtKey, selectedShortestPath, inPort, hasExplicitDestinationPort || hasCompactEntityId);
 
-    {
-        const uint32_t dbgNode = GetObject<Node>()->GetId();
-        const uint32_t dbgVl = headers.datalinkPacketHeader.GetPacketVL();
-        if ((dbgNode == 6 || dbgNode == 8) && dbgVl == 7)
-        {
-            std::cerr << "[VL7FWD] node" << dbgNode << " in=" << inPort
-                      << " dnode=" << utils::IpToNodeId(Ipv4Address(rtKey.dip))
-                      << " op=" << (uint32_t)headers.ctpHeader.GetTPOpcode()
-                      << " out=" << outPort << std::endl;
-        }
-    }
     if (outPort >= 0 && !selectedShortestPath) {
         ForceShortestPathRouting(packet, headers.datalinkPacketHeader);
     }

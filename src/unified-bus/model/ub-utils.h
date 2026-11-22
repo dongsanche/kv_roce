@@ -563,6 +563,24 @@ private:
                                                        ns3::BooleanValue(true),
                                                        ns3::MakeBooleanChecker());
 
+    // Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side)
+    // at creation time. RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults.
+    ns3::GlobalValue g_union_dcqcn_kmin_bytes =
+        ns3::GlobalValue("UB_UNION_DCQCN_KMIN_BYTES",
+                         "Union-only DCQCN Kmin in bytes (matches UbSwitchDcqcn::KminBytes default).",
+                         ns3::UintegerValue(5120),
+                         ns3::MakeUintegerChecker<uint32_t>());
+    ns3::GlobalValue g_union_dcqcn_kmax_bytes =
+        ns3::GlobalValue("UB_UNION_DCQCN_KMAX_BYTES",
+                         "Union-only DCQCN Kmax in bytes (matches UbSwitchDcqcn::KmaxBytes default).",
+                         ns3::UintegerValue(204800),
+                         ns3::MakeUintegerChecker<uint32_t>());
+    ns3::GlobalValue g_union_dcqcn_pmax =
+        ns3::GlobalValue("UB_UNION_DCQCN_PMAX",
+                         "Union-only DCQCN Pmax (marking probability at Kmax).",
+                         ns3::DoubleValue(0.01),
+                         ns3::MakeDoubleChecker<double>(0.0, 1.0));
+
     ns3::GlobalValue g_tpg_phase_hash_enable =
         ns3::GlobalValue("UB_TPG_PHASE_HASH_ENABLE",
                          "Use a seeded hash for the initial RTP TPG TP cursor.",

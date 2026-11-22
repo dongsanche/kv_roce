@@ -4113,6 +4113,17 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
              sw->GetFlowControlTypeForPort(0) == FcType::CBFC_SHARED))
         {
             cc->SetAttributeFailSafe("VlPerNl", UintegerValue(2));
+            // Union-only DCQCN thresholds (UB_UNION_DCQCN_*): lets experiments sensitize union
+            // ECN marking without touching the RoCE switches' ns3::UbSwitchDcqcn defaults.
+            UintegerValue unionKmin;
+            UintegerValue unionKmax;
+            DoubleValue unionPmax;
+            ns3::GlobalValue::GetValueByNameFailSafe("UB_UNION_DCQCN_KMIN_BYTES", unionKmin);
+            ns3::GlobalValue::GetValueByNameFailSafe("UB_UNION_DCQCN_KMAX_BYTES", unionKmax);
+            ns3::GlobalValue::GetValueByNameFailSafe("UB_UNION_DCQCN_PMAX", unionPmax);
+            cc->SetAttributeFailSafe("KminBytes", unionKmin);
+            cc->SetAttributeFailSafe("KmaxBytes", unionKmax);
+            cc->SetAttributeFailSafe("Pmax", unionPmax);
         }
         if (!nodeConfig.forwardDelay.empty())
         {

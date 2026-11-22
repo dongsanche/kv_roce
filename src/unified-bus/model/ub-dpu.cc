@@ -475,17 +475,12 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
     // RoCE→UB 方向（request/CNP/CQE 等）：透传回 UB 侧，并顺带观测控制帧。
     if (IsPortCbfc(outPort))
     {
-        // Scheme 3 (graded hop-by-hop backpressure) ONLY: the DPU terminates the RoCE-domain CNP
-        // at this hop and does NOT forward it to the ASU, so the ASU is driven solely by the
-        // UB-domain local CNP the DPU generates from the union's FECN (no end-to-end CNP leak /
-        // double cut). Gated on GradedBackpressure + TRANSPARENT; schemes 1 (RP) and 2 keep their
-        // default CNP behavior untouched.
+        // Scheme 3 (graded) ONLY, gated on GradedBackpressure + TRANSPARENT (schemes 1/2 untouched):
+        // translate the RoCE-domain CNP into a per-VL UB-side CNP and re-emit it to the ASU
+        // (CTP CC is per-VL), consuming the original.
         if (m_gradedBackpressureEnabled && m_ccRole == CcRole::TRANSPARENT &&
             headers.ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_CNP))
         {
-            // CTP congestion control is per-VL: translate the RoCE-domain CNP into a per-VL
-            // UB-side CNP and re-emit it to the ASU, so the ASU's CTP CC cuts exactly this VL.
-            // Consume the original (it is not forwarded as-is).
             SendCutCnp(DpuFlowKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl});
             return true;
         }

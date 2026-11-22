@@ -113,6 +113,11 @@ global UB_PRIORITY_NUM "16"
 global UB_VL_NUM "16"
 global UB_CC_ALGO "DCQCN"
 global UB_CC_ENABLED "{ub_cc_enabled}"
+# Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side);
+# RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults above.
+global UB_UNION_DCQCN_KMIN_BYTES "{union_kmin}"
+global UB_UNION_DCQCN_KMAX_BYTES "{union_kmax}"
+global UB_UNION_DCQCN_PMAX "{union_pmax}"
 
 global UB_TRACE_ENABLE "true"
 global UB_TASK_TRACE_ENABLE "true"
@@ -362,6 +367,13 @@ def main(argv):
                    help="scheme 3: DPU acts as a per-side CC terminus; when the union marks FECN on "
                         "ASU->NPU data from its local backlog, the DPU sends a local cut-CNP back to "
                         "the source ASU (per-hop local CC). Use with --dpu-role transparent.")
+    p.add_argument("--union-kmin", default="5120",
+                   help="union-only DCQCN Kmin in bytes (CBFC bus switches only; RoCE switches keep "
+                        "the 5120 default). Lower to sensitize union per-NL FECN marking.")
+    p.add_argument("--union-kmax", default="204800",
+                   help="union-only DCQCN Kmax in bytes (CBFC bus switches only; default 204800)")
+    p.add_argument("--union-pmax", default="0.01",
+                   help="union-only DCQCN Pmax (CBFC bus switches only; default 0.01)")
     args = p.parse_args(argv)
 
     asu_port_count = args.union_count  # each ASU connects to every union
@@ -566,6 +578,9 @@ def main(argv):
                                                                                args.ssd_count),
                                                   ssd_queue_count=args.ssd_queue_count,
                                                   shared_pool_bytes=args.shared_pool_bytes,
+                                                  union_kmin=args.union_kmin,
+                                                  union_kmax=args.union_kmax,
+                                                  union_pmax=args.union_pmax,
                                                   cc_trace_enable="true" if args.cc_trace else "false"))
 
     print(f"Generated case in {args.output_dir}: {args.asu_count} ASU, "
