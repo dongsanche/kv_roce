@@ -663,3 +663,36 @@ Kmin=3072（> own 1.4KB、在大流驻留之下）、Pmax=1.0。同 NL（受害 
    已具备该能力），或把不同业务类分到不同 NL。
 4. 观测工具：`DcqcnMarkTrace` 的 `vl_backlog_bytes` 列可以直接量化 false-mark
    （sibling>own）比例，是这套实验得以成立的关键。
+
+
+### 19.10 受害流在两个 regime 的实测性能（TaskTrace 权威口径）
+
+测量口径修正：PACKET_TRACE 关闭时 `task_statistics.csv` 的完成时间列不可靠（恒定出现
+~500µs 伪影偏移）；权威口径是 runlog `TaskTrace_node_*.csv` 的 WQE Starts/Completes
+事件。同一条受害流（1000x1408B、间隔 1µs、ASU0/VL6 高优），仅切换全局 CC：
+
+| 受害流指标 | CC 全开（Kmin=3072） | CC 全关（Kmin=3072） |
+|---|---|---|
+| false marks | 0 | **621（62%）** |
+| 收到 cut-CNP | 0 | 0（CC 关，标记成哑弹） |
+| 完成 p50 | 0.55µs | 0.78µs |
+| 完成 p99 | 0.63µs | **4.77µs（7.6x）** |
+| 完成 max | 0.75µs | **11.16µs（15x）** |
+| 大流 makespan | ~395-427ms（CNP 风暴压垮） | 0.8-2.6ms（近线速） |
+| 系统聚合吞吐 | ~0.9G | **~148G（200G 瓶颈的 74%）** |
+
+读法：
+
+1. **CC 全开：受害流完美**（p50 0.55µs = 线路 RTT 底），但代价是大流被 CNP 风暴压到
+   0.17G/条、系统聚合塌到 ~1G——受害流的"赢"以整体欠吞吐为代价。自愈机理：大流响应
+   CNP → 驻留被排干 → union 无积压可打 → 连坐消失（自动回到安全象限）。
+2. **CC 全关：受害流尾巴真实变差**（p99 7.6x、max 15x）——来自与 6 条线速大流共享
+   200G 瓶颈口的 HOL/PFC 排队，与标记无关（标记本身不加延迟）；62% 的 false marks
+   是哑弹但潜伏在报文里。
+3. **危险象限（大流不理 CNP + 受害流理）无法用全局开关构造**：一旦 621 个 false
+   marks 被受害流的 CC 消费，按 GradedCnpInterval 节流的 cut-CNP 会乘性砍速——同一套
+   砍速机制已在 CC 全开臂实测（大流 1800 次 CNP_RATE_CUT → 0.17G 崩溃）。要定量测该
+   象限需要 per-node/per-VL CcEnabled（候选：GlobalValue UB_CC_DISABLED_NODES 或
+   node.csv 列），留作后续。
+4. 参考点：默认 Kmin(5120) 下 union 永不打标，CC 全开即纯 s3 基线（聚合 35.6G），
+   CC 全关为 182G（91% 线速）——即整个打标故事只发生在敏感化阈值区间内。
