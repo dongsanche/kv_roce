@@ -4124,6 +4124,21 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             Ptr<UbPort> port = CreateObject<UbPort>();
             port->SetAddress(Mac48Address::Allocate());
             node->AddDevice(port);
+            // Pull mode: the 1815e endpoint carries no CBFC credit in the real architecture --
+            // unbound its transmit credit so the per-WQE pull tokens are the binding flow
+            // control. (Switch/DPU ports keep their normal credit; the union->1825 return
+            // stays forward-success-only as the 1825's pull speed.)
+            if (nodeConfig.nodeType == "DEVICE")
+            {
+                BooleanValue pullMode;
+                if (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                    pullMode.Get())
+                {
+                    port->SetAttributeFailSafe(
+                        "CbfcInitCreditCell",
+                        IntegerValue(std::numeric_limits<int32_t>::max() / 2));
+                }
+            }
         }
         if (nodeConfig.nodeType == "DPU")
         {

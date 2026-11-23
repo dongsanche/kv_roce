@@ -741,3 +741,34 @@ QueueTrace：出口 32-91% 时间非空、均值 540KB-1.5MB > Kmax → p=1）�
 per-VL own-backlog 归因打标（19.9）或业务类分 NL。单组对称 incast / decode 小读 /
 全 CC 收敛态（当前默认）均不触发，但默认态的系统吞吐本身被 CNP 风暴压到 1/3——
 两个病各自独立，都需要修。
+
+### 19.13 per-WQE 1825 pull（WIP：机制已通、两个完成阻塞待修）
+
+真实架构对齐（用户确认）：1825 = pull（B），union = 通道化固定映射 + buffer + per-NL 打标，
+1815e 侧无 CBFC credit（pull token 是唯一流控）。实现（`--pull-mode`，默认关）：
+
+- `CTP_PULL` opcode（1825→1815e per-WQE grant token）
+- DPU pull 引擎（per DpuFlowState）：bootstrap（首个请求包过路时发首 token）+
+  burst-quiet 状态机（数据突发停止 `PullQuietTime`(10µs) 且 outstanding(到达−转发)==0 且
+  burstSeen → 发下一个 token = "1825 pull 速度"对 union 的上限保护）+ 单播 token（按流的
+  最后 UB 入口端口，双 union 广播会双倍 grant）
+- 1815e 侧门（`SendResponseSegment` 数据分支）：新 WQE（按 `GetTaskId()`——每请求分段有
+  自己的 TA SSN，tassn 不是 WQE 身份）消耗一个 token；饥饿 WQE 段在 pending 队列里轮转
+  （不阻塞已授权 WQE 的队头）
+- 1815e 端口 CBFC credit 解绑（`UB_PULL_MODE` → DEVICE 端口 CbfcInitCreditCell=巨大）
+- DPU per-flow pending 拆 unscheduled/ack 优先通道（≤256B 小包先出——防止 TAACK 被
+  PFC 冻结的数据积压队头阻塞，真实 NIC 的 ack 队列语义）
+
+**已验证工作**：bootstrap/burst-complete token 全链路触发（打印实测）；task0 的 WQE 整流
+（每 ASU 511-2048 段）；union 无 "ingress buffer full" 丢包（credit 解绑 + pull 窗口约束）；
+pull 关闭时零行为变化（8/8 任务回归通过）。
+
+**两个未修的完成阻塞（WIP）**：
+1. pull + CC 开：CNP 风暴的 debt rescale（`OnCnpReceived` 把 nextAvailableSendTime 重标定
+   到极远）把 1815e 发送冻结——CC 老病 + pull 串行化放大（incast 时长变长 → 风暴充分发展）。
+2. pull + no-cc：请求泵在 ~512 段/WQE 停摆——NPU 的 requester 窗口推进依赖的应答回路在
+   pull 模式下断（ASU 小包 Tx=0），ack 优先通道未解锁，停点在 NPU 泵或请求退役逻辑，
+   需专项调试 CTP 请求/退役回路。
+
+参数与语义备注：union 出口 VOQ 仍由 union→1825 credit（转发成功才还）约束 = pull 速度的
+包级实现；union 打标/per-NL 语义不变（§19 全部结论在 pull 架构下位置不变）。

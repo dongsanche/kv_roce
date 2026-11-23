@@ -529,6 +529,14 @@ UbCtpTransportService::GetTypeId(void)
                           BooleanValue(false),
                           MakeBooleanAccessor(&UbCtpTransportService::m_ccEnabled),
                           MakeBooleanChecker())
+            .AddAttribute("PullMode",
+                          "Per-WQE 1825 pull: response WQEs start only after a CTP_PULL token "
+                          "from the 1825 (one WQE per token; segments of a granted WQE pass "
+                          "free). The ASU->union CBFC credit is expected to be unbound in this "
+                          "mode (the pull window is the binding flow control).",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbCtpTransportService::m_pullMode),
+                          MakeBooleanChecker())
             .AddAttribute("CcLineRate",
                           "CTP congestion-control sender line rate.",
                           DataRateValue(DataRate("400Gbps")),
@@ -1273,6 +1281,15 @@ UbCtpTransportService::HandleReceivedPacket(Ptr<Packet> packet, uint32_t ingress
                             .dstNodeId = wireSrcNodeId,
                             .dstEntityId = srcEntityId,
                             .vl = cnaHeader.GetServiceLevel()};
+    if (ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_PULL))
+    {
+        ++GetOrCreateEntityState(localKey).Rx().receivedPackets;
+        const UbCtpCongestionKey ccKey{.dstNodeId = localKey.dstNodeId,
+                                       .dstEntityId = localKey.dstEntityId,
+                                       .vl = localKey.vl};
+        OnPullTokenReceived(ccKey);
+        return true;
+    }
     if (ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_CNP))
     {
         ++GetOrCreateEntityState(localKey).Rx().receivedPackets;
@@ -1775,6 +1792,32 @@ UbCtpTransportService::OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn)
 }
 
 void
+UbCtpTransportService::OnPullTokenReceived(const UbCtpCongestionKey& key)
+{
+    if (!m_pullMode)
+    {
+        return;
+    }
+    CtpCongestionState& state = GetOrCreateCongestionState(key);
+    state.pullTokens++;
+    // Wake token-starved (parked) response WQEs for this key. The pacing wakeup is NOT used
+    // for token parking, so this is the only drain trigger while starved.
+    const auto parked = m_pendingResponsesByKey.find(key);
+    if (parked != m_pendingResponsesByKey.end() && !parked->second.empty())
+    {
+        for (const auto& [entityKey, jettys] : m_keyJettys)
+        {
+            if (entityKey.dstNodeId == key.dstNodeId &&
+                entityKey.dstEntityId == key.dstEntityId && entityKey.vl == key.vl)
+            {
+                DrainPendingResponses(key, entityKey);
+                break;
+            }
+        }
+    }
+}
+
+void
 UbCtpTransportService::OnExternalRate(const UbCtpCongestionKey& key, uint64_t rateBps)
 {
     if (!m_ccEnabled ||
@@ -1831,9 +1874,28 @@ UbCtpTransportService::DrainPendingResponses(UbCtpCongestionKey ccKey, UbCtpEnti
     CtpCongestionState& state = GetOrCreateCongestionState(ccKey);
     state.pacingWakeupEvent = EventId();
     auto& q = m_pendingResponsesByKey[ccKey];
+    // Pull-mode starvation: rotate a token-starved head (different WQE) to the back so the
+    // already-granted WQE's segments behind it can still pass; a full rotation without any
+    // eligible head means everything waits for a CTP_PULL (the token handler re-drains).
+    uint32_t pullRotations = 0;
     while (!q.empty())
     {
         Ptr<UbWqeSegment> response = q.front();
+        if (m_pullMode)
+        {
+            const uint32_t taskId = response->GetTaskId();
+            if ((!state.pullGrantedValid || state.pullGrantedTassn != taskId) &&
+                state.pullTokens == 0)
+            {
+                if (pullRotations++ < q.size())
+                {
+                    q.pop();
+                    q.push(response);
+                    continue;
+                }
+                return;
+            }
+        }
         if (IsCcLimited(ccKey, static_cast<uint32_t>(response->GetBytesLeft())))
         {
             const Time now = Simulator::Now();
@@ -2186,6 +2248,26 @@ UbCtpTransportService::SendResponseSegment(Ptr<UbWqeSegment> response, UbCtpEnti
         const UbCtpCongestionKey ccKey{.dstNodeId = key.dstNodeId,
                                        .dstEntityId = key.dstEntityId,
                                        .vl = key.vl};
+        // Pull mode gate (per-WQE 1825 pull): a NEW response WQE (different taskId -- each
+        // request segment carries its own TA SSN, so tassn is per-segment, not per-WQE)
+        // consumes one token; segments of the already-granted WQE pass free. Starved WQEs park
+        // in the pending-response queue without a pacing wakeup -- the CTP_PULL handler drains.
+        if (m_pullMode)
+        {
+            CtpCongestionState& pullState = GetOrCreateCongestionState(ccKey);
+            const uint32_t taskId = response->GetTaskId();
+            if (!pullState.pullGrantedValid || pullState.pullGrantedTassn != taskId)
+            {
+                if (pullState.pullTokens == 0)
+                {
+                    m_pendingResponsesByKey[ccKey].push(response);
+                    return false;
+                }
+                pullState.pullTokens--;
+                pullState.pullGrantedTassn = taskId;
+                pullState.pullGrantedValid = true;
+            }
+        }
         if (IsCcLimited(ccKey, progressBytes))
         {
             CtpCongestionState& ccState = GetOrCreateCongestionState(ccKey);

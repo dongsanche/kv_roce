@@ -453,6 +453,9 @@ enum class CtpOpcode : uint8_t {
     CTP_DATA = 0x0,
     CTP_CNP = 0x1,
     CTP_CQE = 0x2,
+    // 1825 -> 1815e per-WQE pull grant (pull mode): the ASU may start one more WQE's
+    // response data. Consumed by the ASU's CTP sender as a token (UbCtpTransportService).
+    CTP_PULL = 0x3,
 };
 
 constexpr uint8_t UB_CNA_NLP_CTPH = 0x0;

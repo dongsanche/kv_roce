@@ -8,6 +8,7 @@
 #include "ns3/event-id.h"
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <queue>
 #include <vector>
@@ -109,6 +110,20 @@ class UbDpu : public UbSwitch
         bool senderStarted{false};
         uint32_t roceOutPort{0};
         std::queue<PendingPacket> pending;
+        // Unscheduled/ack lane: small packets (TAACKs, CNP echoes) bypass the data backlog in
+        // pending. Under PFC backpressure, acks queued FIFO behind megabytes of data starve
+        // the request pump and deadlock pull mode's request-driven response generation.
+        std::queue<PendingPacket> pendingControl;
+        // Pull mode (per-WQE 1825 pull): in-flight accounting and the quiet-detection
+        // state machine that serializes WQE grants (one token per observed data burst).
+        bool pullBootstrapped{false};
+        bool pullBurstSeen{false};
+        uint64_t pullOutstandingBytes{0};
+        Time pullLastArrival{0};
+        EventId pullQuietEvent;
+        // Last UB-side ingress port the flow's data arrived on; tokens are unicast there (a
+        // broadcast token on all UB ports would double-grant via the two unions).
+        uint32_t pullLastUbPort{std::numeric_limits<uint32_t>::max()};
     };
 
     DataRate DeriveRoceLineRate() const;
@@ -116,6 +131,9 @@ class UbDpu : public UbSwitch
     void OnCnpSeen(const DpuFlowKey& key);
     void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
     void SendCutCnp(const DpuFlowKey& key);
+    void SendPullToken(const DpuFlowKey& key, uint32_t ubPort);
+    void SchedulePullQuietCheck(const DpuFlowKey& key);
+    void CheckPullQuiet(const DpuFlowKey& key);
     bool IsRoceVlPaused(uint32_t portId, uint8_t vl) const;
     void TrySendQp(const DpuFlowKey& key);
     void RetryHeldFlows();
@@ -124,6 +142,8 @@ class UbDpu : public UbSwitch
     CcRole m_ccRole{CcRole::TRANSPARENT};
     bool m_gradedBackpressureEnabled{false};
     Time m_gradedCnpInterval{MicroSeconds(50)};
+    bool m_pullMode{false};
+    Time m_pullQuietTime{MicroSeconds(10)};
     bool m_rpPushEnabled{false};
     bool m_rpPfcFeedbackEnabled{true};
     bool m_rpCqeFallbackEnabled{false};

@@ -67,6 +67,22 @@ UbDpu::GetTypeId()
                           TimeValue(MicroSeconds(50)),
                           MakeTimeAccessor(&UbDpu::m_gradedCnpInterval),
                           MakeTimeChecker())
+            .AddAttribute("PullMode",
+                          "Per-WQE 1825 pull: the DPU grants CTP_PULL tokens to source ASUs "
+                          "(one WQE per token). A token is bootstrapped when the DPU first sees "
+                          "the flow (request direction) and re-issued once the granted WQE's "
+                          "data has fully crossed this DPU (burst followed by quiet time, "
+                          "pending drained) -- the 1825's pull speed is what bounds the union "
+                          "buffer. The ASU-side CBFC credit should be unbound in this mode.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&UbDpu::m_pullMode),
+                          MakeBooleanChecker())
+            .AddAttribute("PullQuietTime",
+                          "Pull mode: no-arrival quiet window after which a data burst is "
+                          "considered a completed WQE (token re-issue point).",
+                          TimeValue(MicroSeconds(10)),
+                          MakeTimeAccessor(&UbDpu::m_pullQuietTime),
+                          MakeTimeChecker())
             .AddAttribute("RpPushEnabled",
                           "When true, the RP actively pushes its per-flow rate back to each "
                           "source ASU on every allocation update.",
@@ -326,6 +342,108 @@ UbDpu::SendCutCnp(const DpuFlowKey& key)
 }
 
 void
+UbDpu::SendPullToken(const DpuFlowKey& key, uint32_t ubPort)
+{
+    if (!m_pullMode)
+    {
+        return;
+    }
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr || ubPort >= node->GetNDevices() || !IsUbSide(ubPort))
+    {
+        return;
+    }
+
+    // CTP_PULL token (per-WQE grant), sent from the DPU on behalf of the destination NPU
+    // (scna=NPU, dcna=ASU): the ASU may start one more response WQE on this {NPU, VL}.
+    // Unicast on the flow's arrival port: broadcasting on all UB ports would deliver one
+    // copy per union and double-grant (two WQEs per token).
+    Ptr<Packet> packet = Create<Packet>();
+
+    UbCompactEidHeader eidHeader;
+    eidHeader.SetSourceEid(1);
+    eidHeader.SetDestinationEid(1);
+    packet->AddHeader(eidHeader);
+
+    UbCompactUpiHeader upiHeader;
+    upiHeader.SetUpi(0);
+    packet->AddHeader(upiHeader);
+
+    UbCtpHeader ctpHeader;
+    ctpHeader.SetTPOpcode(CtpOpcode::CTP_PULL);
+    ctpHeader.SetNlp(UB_CTPH_NLP_UPI16_EID40_TAH);
+    packet->AddHeader(ctpHeader);
+
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(key.destinationNodeId)));
+    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(key.sourceNodeId)));
+    cnaHeader.SetServiceLevel(key.vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_CTPH);
+    packet->AddHeader(cnaHeader);
+
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                key.vl,
+                                key.vl,
+                                RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+
+    SendPacket(packet, ubPort, ubPort, key.vl);
+}
+
+void
+UbDpu::SchedulePullQuietCheck(const DpuFlowKey& key)
+{
+    DpuFlowState& flow = GetOrCreateFlowState(key);
+    if (flow.pullQuietEvent.IsPending())
+    {
+        return;
+    }
+    const Time now = Simulator::Now();
+    const Time at = flow.pullLastArrival > now ? flow.pullLastArrival : now;
+    flow.pullQuietEvent =
+        Simulator::Schedule(at + m_pullQuietTime, &UbDpu::CheckPullQuiet, this, key);
+}
+
+void
+UbDpu::CheckPullQuiet(const DpuFlowKey& key)
+{
+    DpuFlowState& flow = GetOrCreateFlowState(key);
+    flow.pullQuietEvent = EventId();
+    const Time now = Simulator::Now();
+    if (now < flow.pullLastArrival + m_pullQuietTime)
+    {
+        // More data arrived meanwhile: not quiet yet, retry at the tail of the burst.
+        Simulator::Schedule(flow.pullLastArrival + m_pullQuietTime, &UbDpu::CheckPullQuiet, this,
+                            key);
+        return;
+    }
+    if (flow.pullOutstandingBytes > 0)
+    {
+        // Granted WQE data still parked here (PFC/egress backpressure): its pull is not done.
+        // The forwarding path re-schedules the quiet check when it drains.
+        return;
+    }
+    if (!flow.pullBootstrapped)
+    {
+        // First sighting of the flow: grant the first WQE.
+        flow.pullBootstrapped = true;
+        flow.pullBurstSeen = false;
+        SendPullToken(key, flow.pullLastUbPort);
+        return;
+    }
+    if (flow.pullBurstSeen)
+    {
+        // A data burst completed (the granted WQE fully crossed this DPU): grant the next.
+        flow.pullBurstSeen = false;
+        SendPullToken(key, flow.pullLastUbPort);
+    }
+    // No burst since the last grant: a token is already in the ASU's pocket (or the flow is
+    // idle) -- issuing another would grow the pocket and break the one-WQE-per-token rule.
+}
+
+void
 UbDpu::RecomputeAllocation()
 {
     const DataRate line = DeriveRoceLineRate();
@@ -438,6 +556,18 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         DpuFlowState& flow = GetOrCreateFlowState(key);
         flow.roceOutPort = outPort;
 
+        // Pull mode arrival accounting: this WQE's data has entered the DPU. The burst flag
+        // arms the next token issue once the burst goes quiet AND everything has been
+        // forwarded (CheckPullQuiet) -- that is the 1825 pull-speed bound on the union.
+        if (m_pullMode)
+        {
+            flow.pullOutstandingBytes += packet->GetSize();
+            flow.pullBurstSeen = true;
+            flow.pullLastArrival = Simulator::Now();
+            flow.pullLastUbPort = inPort;
+            SchedulePullQuietCheck(key);
+        }
+
         // Start the periodic allocation loop on the first observed data packet, so rate control
         // works without relying on PFC feedback.
         if (m_ccRole == CcRole::RP && !m_allocEvent.IsPending())
@@ -463,7 +593,16 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         // Hold the packet in the per-flow QP. The UB-side CBFC credit is NOT returned here; it is
         // returned only once TrySendQp actually forwards the packet to the RoCE egress, so a
         // PFC-paused / full egress backpressures the upstream ASU instead of dropping.
-        flow.pending.push(PendingPacket{packet, inPort});
+        // Small packets (TAACKs / CNP echoes) take the unscheduled lane so acks never queue
+        // behind the data backlog (otherwise PFC backpressure starves the request pump).
+        if (packet->GetSize() <= 256)
+        {
+            flow.pendingControl.push(PendingPacket{packet, inPort});
+        }
+        else
+        {
+            flow.pending.push(PendingPacket{packet, inPort});
+        }
         TrySendQp(key);
         if (!m_retryEvent.IsPending())
         {
@@ -475,6 +614,23 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
     // RoCE→UB 方向（request/CNP/CQE 等）：透传回 UB 侧，并顺带观测控制帧。
     if (IsPortCbfc(outPort))
     {
+        // Pull mode bootstrap: the first CTP packet toward an ASU (typically its READ request)
+        // proves the flow exists -- grant the first WQE token so the ASU's parked response WQE
+        // can start. Without this the ASU would wait forever (it only sends on tokens).
+        if (m_pullMode)
+        {
+            const DpuFlowKey pullKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
+            DpuFlowState& pullFlow = GetOrCreateFlowState(pullKey);
+            if (!pullFlow.pullBootstrapped)
+            {
+                pullFlow.pullBootstrapped = true;
+                if (pullFlow.pullLastUbPort == std::numeric_limits<uint32_t>::max())
+                {
+                    pullFlow.pullLastUbPort = outPort;
+                }
+                SendPullToken(pullKey, pullFlow.pullLastUbPort);
+            }
+        }
         // Scheme 3 (graded) ONLY, gated on GradedBackpressure + TRANSPARENT (schemes 1/2 untouched):
         // translate the RoCE-domain CNP into a per-VL UB-side CNP and re-emit it to the ASU
         // (CTP CC is per-VL), consuming the original.
@@ -556,6 +712,39 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
     Ptr<UbEgressQueue> egress = outDevice->GetUbQueue();
     const uint64_t rateBps = std::max<uint64_t>(1u, flow.currentRate.GetBitRate());
     bool sent = false;
+    // Unscheduled lane first: small packets (TAACKs / CNP echoes) drain ahead of the data
+    // backlog so acks survive PFC backpressure (request-pump starvation otherwise deadlocks
+    // pull mode's request-driven response generation).
+    while (!flow.pendingControl.empty())
+    {
+        const PendingPacket& front = flow.pendingControl.front();
+        if (egress != nullptr && !egress->CanEnqueue(front.packet->GetSize()))
+        {
+            break; // egress queue byte limit reached: hold, retry later
+        }
+        if (!outDevice->EnqueueToEgress(std::make_tuple(flow.roceOutPort, key.vl, front.packet)))
+        {
+            break; // egress rejected the packet: hold
+        }
+        Ptr<UbPort> inDevice = DynamicCast<UbPort>(node->GetDevice(front.inPortId));
+        if (inDevice != nullptr && IsPortCbfc(front.inPortId))
+        {
+            UbFlowControlEventContext ctx;
+            ctx.packet = front.packet;
+            ctx.inPortId = front.inPortId;
+            ctx.outPortId = flow.roceOutPort;
+            ctx.priority = key.vl;
+            ctx.upstreamCreditAlreadyReturned = false;
+            inDevice->GetFlowControl()->OnIngressReleased(ctx);
+        }
+        if (m_pullMode)
+        {
+            flow.pullOutstandingBytes -= front.packet->GetSize();
+            SchedulePullQuietCheck(key);
+        }
+        flow.pendingControl.pop();
+        sent = true;
+    }
     while (!flow.pending.empty())
     {
         const PendingPacket& front = flow.pending.front();
@@ -580,6 +769,15 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
             ctx.priority = key.vl;
             ctx.upstreamCreditAlreadyReturned = false;
             inDevice->GetFlowControl()->OnIngressReleased(ctx);
+        }
+
+        // Pull mode: the granted WQE's data progressed through the DPU toward the RoCE wire.
+        // Once the flow fully drains (outstanding == 0) and goes quiet, CheckPullQuiet issues
+        // the next token -- the pull-speed bound.
+        if (m_pullMode)
+        {
+            flow.pullOutstandingBytes -= front.packet->GetSize();
+            SchedulePullQuietCheck(key);
         }
 
         const double seconds =

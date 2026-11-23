@@ -606,6 +606,17 @@ private:
                          ns3::StringValue(""),
                          ns3::MakeStringChecker());
 
+    // Per-WQE 1825 pull mode master switch. When true, DEVICE (1815e endpoint) ports get an
+    // effectively unbounded CBFC transmit credit -- the 1815e side carries no credit in the
+    // real architecture; the binding flow control is the 1825's per-WQE pull tokens. The
+    // union->1825 credit return (forward-success-only) is kept as the 1825 pull speed at
+    // packet granularity.
+    ns3::GlobalValue g_pull_mode =
+        ns3::GlobalValue("UB_PULL_MODE",
+                         "Enable per-WQE 1825 pull (also unbounds 1815e-side CBFC credit).",
+                         ns3::BooleanValue(false),
+                         ns3::MakeBooleanChecker());
+
     ns3::GlobalValue g_tpg_phase_hash_enable =
         ns3::GlobalValue("UB_TPG_PHASE_HASH_ENABLE",
                          "Use a seeded hash for the initial RTP TPG TP cursor.",
