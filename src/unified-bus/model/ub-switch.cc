@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <sstream>
+#include <string>
 #include "ns3/ipv4.h"
 #include "ns3/node-list.h"
 #include "ns3/packet.h"
@@ -76,6 +79,16 @@ TypeId UbSwitch::GetTypeId (void)
                       MakeEnumAccessor<VlScheduler>(&UbSwitch::m_vlScheduler),
                       MakeEnumChecker(SP, "SP",
                                       DWRR, "DWRR"))
+        .AddAttribute("StaticIngressEgressMap",
+                      "Channelized bus mapping 'inPort:outPort,...' (e.g. '0:4,1:4,2:5,3:5'). "
+                      "When set, a packet arriving on a mapped ingress port egresses via the "
+                      "mapped port if that port is a valid next hop for the packet's "
+                      "destination (candidate-set + link-up checked; otherwise falls back to "
+                      "the routed port). Models a fixed-lane bus union instead of per-flow "
+                      "ECMP spraying.",
+                      StringValue(""),
+                      MakeStringAccessor(&UbSwitch::m_staticIngressMapStr),
+                      MakeStringChecker())
         .AddAttribute("InPortProcessingDelay",
                       "Fixed non-blocking input-port processing latency after route/output are "
                       "known and before the packet becomes visible in VOQ to the allocator.",
@@ -1116,6 +1129,79 @@ void UbSwitch::ForceShortestPathRouting(Ptr<Packet> packet, const UbDatalinkPack
     packet->AddHeader(modifiedHeader);
 }
 
+int
+UbSwitch::ApplyStaticIngressMap(uint32_t inPort, int outPort, const RoutingKey& rtKey)
+{
+    if (outPort < 0)
+    {
+        return outPort;
+    }
+    if (!m_staticIngressMapParsed)
+    {
+        m_staticIngressMapParsed = true;
+        const std::string& spec = m_staticIngressMapStr;
+        if (!spec.empty())
+        {
+            std::istringstream iss(spec);
+            std::string token;
+            while (std::getline(iss, token, ','))
+            {
+                const auto sep = token.find(':');
+                if (sep == std::string::npos)
+                {
+                    continue;
+                }
+                try
+                {
+                    const uint32_t in = std::stoul(token.substr(0, sep));
+                    const uint32_t out = std::stoul(token.substr(sep + 1));
+                    m_staticIngressMap[in] = out;
+                }
+                catch (const std::exception&)
+                {
+                    NS_ABORT_MSG("StaticIngressEgressMap: invalid token '" << token << "'");
+                }
+            }
+        }
+        if (!m_staticIngressMap.empty())
+        {
+            NS_LOG_INFO("Static ingress->egress lane map active on node "
+                        << GetObject<Node>()->GetId() << ": " << spec);
+        }
+    }
+    if (m_staticIngressMap.empty())
+    {
+        return outPort;
+    }
+    const auto it = m_staticIngressMap.find(inPort);
+    if (it == m_staticIngressMap.end() || it->second == static_cast<uint32_t>(outPort))
+    {
+        return outPort;
+    }
+    const uint32_t mapped = it->second;
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr || mapped >= node->GetNDevices())
+    {
+        return outPort;
+    }
+    const Ptr<UbPort> mappedPort = DynamicCast<UbPort>(node->GetDevice(mapped));
+    if (mappedPort == nullptr || !mappedPort->IsLinkUp())
+    {
+        return outPort;
+    }
+    // The mapped lane must genuinely lead to the packet's destination (guards reverse
+    // traffic with unique-port destinations and failed lanes).
+    const std::vector<uint16_t> candidates = m_routingProcess->GetAllOutPorts(rtKey.dip);
+    for (const uint16_t c : candidates)
+    {
+        if (c == mapped)
+        {
+            return static_cast<int>(mapped);
+        }
+    }
+    return outPort;
+}
+
 /**
  * @brief Shared URMA output resolution used by arrival forwarding and recovery transfer.
  *
@@ -1131,8 +1217,11 @@ UbSwitch::ResolveURMAOutput(Ptr<Packet> packet,
 {
     GetURMARoutingKey(headers, rtKey);
     const bool hasExplicitDestinationPort = (rtKey.dip & 0xff) != 0;
-    const int outPort = m_routingProcess->GetOutPortAfterFailure(
-        rtKey, selectedShortestPath, inPort, hasExplicitDestinationPort);
+    const int outPort = ApplyStaticIngressMap(
+        inPort,
+        m_routingProcess->GetOutPortAfterFailure(rtKey, selectedShortestPath, inPort,
+                                                 hasExplicitDestinationPort),
+        rtKey);
 
     // If packet routed via non-shortest path, force subsequent hops to use shortest path
     if (outPort >= 0 && !selectedShortestPath) {
@@ -1153,8 +1242,11 @@ UbSwitch::ResolveLdstOutput(Ptr<Packet> packet,
 {
     GetLdstRoutingKey(headers, rtKey);
     const bool hasExplicitDestinationPort = headers.network.destination.hasPort;
-    const int outPort = m_routingProcess->GetOutPortAfterFailure(
-        rtKey, selectedShortestPath, inPort, hasExplicitDestinationPort);
+    const int outPort = ApplyStaticIngressMap(
+        inPort,
+        m_routingProcess->GetOutPortAfterFailure(rtKey, selectedShortestPath, inPort,
+                                                 hasExplicitDestinationPort),
+        rtKey);
 
     if (outPort >= 0 && !selectedShortestPath) {
         ForceShortestPathRouting(packet, headers.datalinkPacketHeader);
@@ -1208,8 +1300,11 @@ UbSwitch::ResolveCtpOutput(Ptr<Packet> packet,
         rtKey.dip = utils::NodeIdToIp(destinationNodeId, destinationPort).Get();
         rtKey.dport = destinationPort;
     }
-    const int outPort = m_routingProcess->GetOutPortAfterFailure(
-        rtKey, selectedShortestPath, inPort, hasExplicitDestinationPort || hasCompactEntityId);
+    const int outPort = ApplyStaticIngressMap(
+        inPort,
+        m_routingProcess->GetOutPortAfterFailure(rtKey, selectedShortestPath, inPort,
+                                                 hasExplicitDestinationPort || hasCompactEntityId),
+        rtKey);
 
     if (outPort >= 0 && !selectedShortestPath) {
         ForceShortestPathRouting(packet, headers.datalinkPacketHeader);

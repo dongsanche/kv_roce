@@ -4,6 +4,8 @@
 #include "ns3/ub-ldst-packet-utils.h"
 
 #include <optional>
+#include <map>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include "ns3/nstime.h"
@@ -459,6 +461,25 @@ private:
         DWRR = 1
     };
     VlScheduler m_vlScheduler {SP};
+
+    /**
+     * @brief Channelized bus union: fixed ingress->egress lane mapping.
+     *
+     * Parsed lazily from the StaticIngressEgressMap attribute ("inPort:outPort,...").
+     * Empty map = per-flow ECMP (default). See ApplyStaticIngressMap.
+     */
+    std::string m_staticIngressMapStr;
+    std::map<uint32_t, uint32_t> m_staticIngressMap;
+    bool m_staticIngressMapParsed{false};
+
+    /**
+     * @brief Override the routed egress port with the static lane map when valid.
+     *
+     * Applied only when the mapped port is an existing, link-up port AND a routing
+     * candidate for the packet's destination, so reverse traffic (unique-port
+     * destinations) and link failures fall back to normal routing.
+     */
+    int ApplyStaticIngressMap(uint32_t inPort, int outPort, const RoutingKey& rtKey);
 };
 
 } // namespace ns3

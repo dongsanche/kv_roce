@@ -4162,6 +4162,15 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             cc->SetAttributeFailSafe("KminBytes", unionKmin);
             cc->SetAttributeFailSafe("KmaxBytes", unionKmax);
             cc->SetAttributeFailSafe("Pmax", unionPmax);
+            // Union-only channelized lane map (UB_UNION_STATIC_INGRESS_MAP): fixed
+            // ASU-port -> gateway-egress lanes (bus union) instead of per-flow ECMP.
+            StringValue unionLaneMap;
+            if (ns3::GlobalValue::GetValueByNameFailSafe("UB_UNION_STATIC_INGRESS_MAP",
+                                                         unionLaneMap) &&
+                !unionLaneMap.Get().empty())
+            {
+                sw->SetAttributeFailSafe("StaticIngressEgressMap", unionLaneMap);
+            }
         }
         if (!nodeConfig.forwardDelay.empty())
         {

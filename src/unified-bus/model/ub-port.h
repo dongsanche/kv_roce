@@ -180,6 +180,8 @@ public:
 
     void NotifyLinkUp(void);
 
+    bool IsLinkUp() const { return m_linkUp; }
+
     void TriggerTransmit();
     void NotifyAllocationFinish();
 

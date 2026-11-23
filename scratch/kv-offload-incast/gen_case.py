@@ -115,6 +115,8 @@ global UB_CC_ALGO "DCQCN"
 global UB_CC_ENABLED "{ub_cc_enabled}"
 # Per-node CTP CC opt-out: listed nodes' senders ignore CNPs/external rates (CC-blind).
 global UB_CC_DISABLED_NODES "{cc_disabled_nodes}"
+# Union-only channelized lane map: fixed ASU-port -> gateway-egress lanes (bus union).
+global UB_UNION_STATIC_INGRESS_MAP "{union_static_map}"
 # Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side);
 # RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults above.
 global UB_UNION_DCQCN_KMIN_BYTES "{union_kmin}"
@@ -380,6 +382,10 @@ def main(argv):
                    help="comma-separated node IDs whose CTP senders ignore CNPs (CC-blind), "
                         "e.g. '0,1,2' to keep the heavy ASUs at line rate while the victim ASU "
                         "still consumes cut-CNPs")
+    p.add_argument("--union-static-map", default="",
+                   help="union-only channelized lane map 'inPort:outPort,...', e.g. "
+                        "'0:4,1:4,2:5,3:5' (ASU ports 0,1 fixed to gateway egress 4; 2,3 to 5). "
+                        "Replaces per-flow ECMP on the bus union; empty = ECMP (default).")
     args = p.parse_args(argv)
 
     asu_port_count = args.union_count  # each ASU connects to every union
@@ -579,6 +585,7 @@ def main(argv):
                                                   ctp_cc_enabled=cc_flag,
                                                   ub_cc_enabled=cc_flag,
                                                   cc_disabled_nodes=args.cc_disabled_nodes,
+                                                  union_static_map=args.union_static_map,
                                                   ssd_read_latency=args.ssd_read_latency,
                                                   ssd_write_latency=args.ssd_write_latency,
                                                   ssd_bandwidth=scale_bandwidth(args.ssd_bandwidth,

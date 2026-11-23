@@ -595,6 +595,17 @@ private:
                          ns3::StringValue(""),
                          ns3::MakeStringChecker());
 
+    // Union-only channelized lane map ("inPort:outPort,...", e.g. "0:4,1:4,2:5,3:5").
+    // Applied only to CBFC bus switches (the union) at creation time: fixed ASU-port ->
+    // gateway-egress lanes replace per-flow ECMP spraying, matching the real bus union.
+    // RoCE (PFC) switches keep per-flow multipath routing.
+    ns3::GlobalValue g_union_static_ingress_map =
+        ns3::GlobalValue("UB_UNION_STATIC_INGRESS_MAP",
+                         "Union-only static ingress->egress lane map 'in:out,...' (empty = "
+                         "per-flow ECMP).",
+                         ns3::StringValue(""),
+                         ns3::MakeStringChecker());
+
     ns3::GlobalValue g_tpg_phase_hash_enable =
         ns3::GlobalValue("UB_TPG_PHASE_HASH_ENABLE",
                          "Use a seeded hash for the initial RTP TPG TP cursor.",
