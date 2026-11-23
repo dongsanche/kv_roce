@@ -113,6 +113,8 @@ global UB_PRIORITY_NUM "16"
 global UB_VL_NUM "16"
 global UB_CC_ALGO "DCQCN"
 global UB_CC_ENABLED "{ub_cc_enabled}"
+# Per-node CTP CC opt-out: listed nodes' senders ignore CNPs/external rates (CC-blind).
+global UB_CC_DISABLED_NODES "{cc_disabled_nodes}"
 # Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side);
 # RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults above.
 global UB_UNION_DCQCN_KMIN_BYTES "{union_kmin}"
@@ -374,6 +376,10 @@ def main(argv):
                    help="union-only DCQCN Kmax in bytes (CBFC bus switches only; default 204800)")
     p.add_argument("--union-pmax", default="0.01",
                    help="union-only DCQCN Pmax (CBFC bus switches only; default 0.01)")
+    p.add_argument("--cc-disabled-nodes", default="",
+                   help="comma-separated node IDs whose CTP senders ignore CNPs (CC-blind), "
+                        "e.g. '0,1,2' to keep the heavy ASUs at line rate while the victim ASU "
+                        "still consumes cut-CNPs")
     args = p.parse_args(argv)
 
     asu_port_count = args.union_count  # each ASU connects to every union
@@ -572,6 +578,7 @@ def main(argv):
                                                   ctp_cnp_interval=args.ctp_cnp_interval,
                                                   ctp_cc_enabled=cc_flag,
                                                   ub_cc_enabled=cc_flag,
+                                                  cc_disabled_nodes=args.cc_disabled_nodes,
                                                   ssd_read_latency=args.ssd_read_latency,
                                                   ssd_write_latency=args.ssd_write_latency,
                                                   ssd_bandwidth=scale_bandwidth(args.ssd_bandwidth,

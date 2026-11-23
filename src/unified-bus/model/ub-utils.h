@@ -382,6 +382,8 @@ public:
 
     static bool IsCongestionControlTraceEnabled();
 
+    static bool IsCcDisabledForNode(uint32_t nodeId);
+
     static bool IsQueueTraceEnabled();
 
     static bool IsTpDebugEnabledFor(uint32_t nodeId, uint32_t tpn);
@@ -582,6 +584,16 @@ private:
                          "Union-only DCQCN Pmax (marking probability at Kmax).",
                          ns3::DoubleValue(0.01),
                          ns3::MakeDoubleChecker<double>(0.0, 1.0));
+
+    // Per-node CTP CC opt-out: comma-separated node IDs whose CTP senders ignore received
+    // CNPs / external rates (CC-blind: never throttled, always line rate). Used to model
+    // asymmetric CC responsiveness (e.g. heavy flows that do not react to congestion signals
+    // while a victim flow does) without turning marking off system-wide.
+    ns3::GlobalValue g_cc_disabled_nodes =
+        ns3::GlobalValue("UB_CC_DISABLED_NODES",
+                         "Comma-separated node IDs whose CTP senders ignore CNPs (CC-blind).",
+                         ns3::StringValue(""),
+                         ns3::MakeStringChecker());
 
     ns3::GlobalValue g_tpg_phase_hash_enable =
         ns3::GlobalValue("UB_TPG_PHASE_HASH_ENABLE",

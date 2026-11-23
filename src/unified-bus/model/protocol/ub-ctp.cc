@@ -1733,7 +1733,10 @@ void
 UbCtpTransportService::OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn)
 {
     (void)ecn;
-    if (!m_ccEnabled)
+    // Per-node CC opt-out (UB_CC_DISABLED_NODES): this sender ignores CNPs entirely, so a
+    // CC-blind source keeps its line rate even while its NL sibling is congested.
+    if (!m_ccEnabled ||
+        utils::UbUtils::IsCcDisabledForNode(m_node == nullptr ? UINT32_MAX : m_node->GetId()))
     {
         return;
     }
@@ -1774,7 +1777,8 @@ UbCtpTransportService::OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn)
 void
 UbCtpTransportService::OnExternalRate(const UbCtpCongestionKey& key, uint64_t rateBps)
 {
-    if (!m_ccEnabled)
+    if (!m_ccEnabled ||
+        utils::UbUtils::IsCcDisabledForNode(m_node == nullptr ? UINT32_MAX : m_node->GetId()))
     {
         return;
     }

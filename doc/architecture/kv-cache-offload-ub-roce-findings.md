@@ -696,3 +696,48 @@ Kmin=3072（> own 1.4KB、在大流驻留之下）、Pmax=1.0。同 NL（受害 
    node.csv 列），留作后续。
 4. 参考点：默认 Kmin(5120) 下 union 永不打标，CC 全开即纯 s3 基线（聚合 35.6G），
    CC 全关为 182G（91% 线速）——即整个打标故事只发生在敏感化阈值区间内。
+
+### 19.11 危险象限定量：multi-incast + 非对称 CC（默认 union 阈值）
+
+工具：新增 `UB_CC_DISABLED_NODES` global（逗号分隔节点表，表中节点的 CTP sender 忽略
+CNP/外部速率=CC 盲；`OnCnpReceived`/`OnExternalRate` 均受其门控），gen_case 加
+`--cc-disabled-nodes`。由此可构造"大流 CC 盲 + 受害流 CC 开"的危险象限。
+
+场景：multi-incast，4 ASU / 2 union / 2 NPU，`--high-asu-count 3`——NPU0 读 ASU0-2
+（6x8MB bulk，VL6），NPU1 读 ASU3（2x8MB，受害 VL）。受害流自身对 NPU1 是 2:1 小
+incast（自拥塞打标合法）。四臂除 CC 配置与受害 VL 外完全相同，**union 阈值全默认**
+（Kmin 5120 / Kmax 204800 / Pmax 0.01）：
+
+| 臂 | CC 配置 | 受害 VL | NPU0 批 (48MB) | NPU1 批 (16MB) | 丢包 |
+|---|---|---|---|---|---|
+| A | 大流盲(0,1,2)+受害开，同 NL | VL7 (NL3, 重流 VL6 同 NL) | 2.41ms / 159G | **19.1ms / 6.7G** | 182 |
+| B | 同 A 但受害隔离 NL | VL8 (NL4) | 2.45ms / 157G | 8.15ms / 15.7G | 184 |
+| C | 全 CC 盲（标记成哑弹） | VL7 (NL3) | 2.46ms / 156G | **1.11ms / 115G** | 188 |
+| D | 全 CC 开（= 现默认 s3） | VL7 (NL3) | 8.36ms / 45.9G | 2.59ms / 49.4G | 0 |
+
+A 臂受害轨迹（CtpSenderTrace）：t=14.8µs 2 刀自拥塞砍速（100→25G，RoCE 侧合法）→
+t=82-136µs union 6 个 false mark（own=4124B=单包 vs sibling VL6 驻留 150KB-970KB，
+QueueTrace：出口 32-91% 时间非空、均值 540KB-1.5MB > Kmax → p=1）→ 8 刀连环
+（25G→0.79G）→ t=292µs 第 7 个 mark → 20Mbps；剩余 16MB 在爬速中拖成 13.3-19.1ms。
+
+**读法**：
+
+1. **NL 连坐税（A vs B）**：同一受害流仅因与重流同 NL，NPU1 批吞吐 15.7G→6.7G
+   （**-57%**），批时间 +10.9ms（+134%）——全部由 7 个 sibling-driven false mark
+   （B 臂为 0）造成；**union 默认阈值即触发**（驻留 > Kmax 时 p=1，无需敏感化）。
+2. **消费税（A vs C）**：false mark 不被 CC 消费时是哑弹（C：1541 个 mark、0 伤害、
+   批 115G 近线速）；被消费后 7 个 mark 就足够把批吞吐打掉 94%（115G→6.7G）。
+   伤害 = 标记 x 消费，两个条件缺一不可。
+3. **自愈税（D vs A/B/C）**：全 CC 开时无 false mark（重流自砍、驻留消失），但 NPU0
+   批吞吐 45.9G vs 盲臂 159G（**-71%**，RoCE 侧 CNP 风暴），NPU1 也只 49.4G——
+   即"安全"是用系统级欠吞吐换的（Regime A 老病）。
+4. 丢包：三盲臂 182-188（非无损），D 0——无损与高吞吐在本配置下不可兼得。
+
+### 19.12 系统级结论（回答"推理 incast 场景何时伤最深"）
+
+定量回答：**错峰多组 prefill（多 NPU 端到端不同拥塞态）+ bulk 受害流 + 施害方对 CNP
+反应迟钝（真实 PFC 瞬态如此）+ 同 NL 编排**时，受害 NPU 的 batch 吞吐被 NL 连坐单独
+打掉 ~57%（15.7→6.7G），全链只需 7 个 false mark、14 刀砍速；修复方向 =
+per-VL own-backlog 归因打标（19.9）或业务类分 NL。单组对称 incast / decode 小读 /
+全 CC 收敛态（当前默认）均不触发，但默认态的系统吞吐本身被 CNP 风暴压到 1/3——
+两个病各自独立，都需要修。

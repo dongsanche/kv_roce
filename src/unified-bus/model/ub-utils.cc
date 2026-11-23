@@ -1853,6 +1853,38 @@ UbUtils::IsFlowControlTraceEnabled()
 }
 
 bool
+UbUtils::IsCcDisabledForNode(uint32_t nodeId)
+{
+    // Parsed once on first use: the GlobalValue is set during config load, before any
+    // simulation event that can reach this helper.
+    static std::optional<std::set<uint32_t>> disabledNodes;
+    if (!disabledNodes.has_value())
+    {
+        std::set<uint32_t> nodes;
+        StringValue value;
+        if (GlobalValue::GetValueByNameFailSafe("UB_CC_DISABLED_NODES", value) &&
+            !value.Get().empty())
+        {
+            std::istringstream iss(value.Get());
+            std::string token;
+            while (std::getline(iss, token, ','))
+            {
+                try
+                {
+                    nodes.insert(std::stoul(token));
+                }
+                catch (const std::exception&)
+                {
+                    NS_ABORT_MSG("UB_CC_DISABLED_NODES: invalid node id token '" << token << "'");
+                }
+            }
+        }
+        disabledNodes = nodes;
+    }
+    return disabledNodes->count(nodeId) > 0;
+}
+
+bool
 UbUtils::IsCongestionControlTraceEnabled()
 {
     if (!IsTraceEnabled())
