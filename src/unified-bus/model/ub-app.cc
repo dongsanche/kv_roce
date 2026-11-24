@@ -8,6 +8,10 @@
 #include "ns3/log.h"
 #include "ns3/simulator.h"
 #include "ns3/ub-ctp.h"
+#include "ns3/ub-controller.h"
+#include "ns3/ub-datalink.h"
+#include "ns3/ub-network-address.h"
+#include "ns3/ub-header.h"
 #include "ns3/ub-datatype.h"
 #include "ns3/ub-function.h"
 #include "ns3/ub-port.h"
@@ -409,6 +413,18 @@ UbApp::SendTraffic(UbTrafficGen::RuntimeTask task)
                             task.taskId);
         return;
     }
+    {
+        static const bool kvPush = []() {
+            BooleanValue enabled;
+            return GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", enabled) && enabled.Get();
+        }();
+        if (kvPush && task.op == UbTrafficGen::RuntimeTaskOp::URMA_READ)
+        {
+            // KV-push protocol: one READ request per WQE; the ASU then actively pushes.
+            SendKvReadRequest(task);
+            return;
+        }
+    }
     if (task.priority == 0)
     {
         NS_LOG_DEBUG("Task uses the highest priority, not recommended.");
@@ -697,6 +713,212 @@ void
 UbApp::WqeTaskCompletesNotify(uint32_t nodeId, uint32_t jettyNum, uint32_t taskId)
 {
     m_traceWqeTaskCompletesNotify(nodeId, jettyNum, taskId);
+}
+
+// ============================ KV-push protocol ============================
+
+Ptr<UbPort>
+UbApp::FirstUbPort() const
+{
+    Ptr<Node> node = GetNode();
+    if (node == nullptr)
+    {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < node->GetNDevices(); ++i)
+    {
+        Ptr<UbPort> port = DynamicCast<UbPort>(node->GetDevice(i));
+        if (port != nullptr)
+        {
+            return port;
+        }
+    }
+    return nullptr;
+}
+
+bool
+UbApp::EnqueueKvFrame(Ptr<UbPort> port,
+                      uint32_t dstNode,
+                      uint8_t vl,
+                      const UbKvHeader& kv,
+                      uint32_t payloadBytes)
+{
+    if (port == nullptr)
+    {
+        return false;
+    }
+    Ptr<Packet> packet = Create<Packet>(payloadBytes);
+    packet->AddHeader(kv);
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(GetNode()->GetId())));
+    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(dstNode)));
+    cnaHeader.SetServiceLevel(vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_KVPUSH);
+    packet->AddHeader(cnaHeader);
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                vl,
+                                vl,
+                                RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+    Ptr<UbController> controller = GetNode()->GetObject<UbController>();
+    Ptr<UbCtpTransportService> service =
+        controller != nullptr ? controller->GetCtpTransportService() : nullptr;
+    if (service == nullptr)
+    {
+        return false;
+    }
+    return service->SendRawFrame(packet, port->GetIfIndex(), vl);
+}
+
+void
+UbApp::SendKvReadRequest(const UbTrafficGen::RuntimeTask& task)
+{
+    UbKvHeader kv;
+    kv.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_READ_REQ));
+    kv.SetVl(task.priority);
+    kv.SetLength(task.dataSize);
+    kv.SetTaskId(task.taskId);
+    kv.SetKvAddr(static_cast<uint64_t>(task.taskId) * 4096ULL); // KV source address (synthetic)
+    kv.SetSeq(task.taskId);
+
+    m_kvRxExpected[task.taskId] = task.dataSize;
+    m_kvRxBytes[task.taskId] = 0;
+    if (!EnqueueKvFrame(FirstUbPort(), task.destNode, task.priority, kv, 0))
+    {
+        NS_LOG_WARN("KV READ request enqueue failed for task " << task.taskId);
+    }
+}
+
+void
+UbApp::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId)
+{
+    if (frame == nullptr)
+    {
+        return;
+    }
+    UbKvHeader kv;
+    frame->RemoveHeader(kv);
+    const uint32_t taskId = kv.GetTaskId();
+    switch (static_cast<KvOpcode>(kv.GetOpcode()))
+    {
+    case KvOpcode::KV_READ_REQ:
+    {
+                // ASU: the request arrives; run the SSD read then actively push the data.
+        KvPushTask push;
+        push.taskId = taskId;
+        push.dstNode = sourceNodeId;
+        push.vl = kv.GetVl();
+        push.remaining = kv.GetLength();
+        push.offset = 0;
+        m_kvPushTasks[taskId] = push;
+        Ptr<UbController> controller = GetNode()->GetObject<UbController>();
+        Ptr<UbSsd> ssd = controller != nullptr ? controller->GetUbSsd() : nullptr;
+        if (ssd != nullptr)
+        {
+            ssd->SubmitRead(taskId,
+                            kv.GetLength(),
+                            MakeCallback(&UbApp::StartKvPush, this, taskId),
+                            true);
+        }
+        else
+        {
+            Simulator::Schedule(MicroSeconds(50), &UbApp::StartKvPush, this, taskId);
+        }
+        break;
+    }
+    case KvOpcode::KV_CREDIT:
+    {
+                // ASU: the 1825 returned push credit; resume every push waiting on this flow.
+        m_kvPushCredits[{sourceNodeId, kv.GetVl()}] += static_cast<int64_t>(kv.GetKvAddr());
+        std::vector<uint32_t> pending;
+        for (const auto& [id, push] : m_kvPushTasks)
+        {
+            if (push.dstNode == sourceNodeId && push.vl == kv.GetVl())
+            {
+                pending.push_back(id);
+            }
+        }
+        for (const uint32_t id : pending)
+        {
+            PumpKvPush(id);
+        }
+        break;
+    }
+    case KvOpcode::KV_DATA:
+    {
+        // NPU: accumulate pushed data; the IO completes once the whole length arrived.
+        m_kvRxBytes[taskId] += kv.GetLength();
+        if (m_kvRxBytes[taskId] >= m_kvRxExpected[taskId] && m_kvCompleted.insert(taskId).second)
+        {
+            UbTrafficGen::Get()->OnTaskCompleted(taskId);
+        }
+        break;
+    }
+    case KvOpcode::KV_DONE:
+    {
+        if (m_kvCompleted.insert(taskId).second)
+        {
+            UbTrafficGen::Get()->OnTaskCompleted(taskId);
+        }
+        break;
+    }
+    }
+}
+
+void
+UbApp::StartKvPush(uint32_t taskId)
+{
+    PumpKvPush(taskId);
+}
+
+void
+UbApp::PumpKvPush(uint32_t taskId)
+{
+    const auto it = m_kvPushTasks.find(taskId);
+    if (it == m_kvPushTasks.end())
+    {
+        return;
+    }
+    KvPushTask& push = it->second;
+    Ptr<UbPort> port = FirstUbPort();
+    if (port == nullptr)
+    {
+        return;
+    }
+    int64_t& credit = m_kvPushCredits[{push.dstNode, push.vl}];
+    while (push.remaining > 0)
+    {
+        const uint32_t frameBytes = static_cast<uint32_t>(std::min<uint64_t>(push.remaining, 4096));
+        if (credit < static_cast<int64_t>(frameBytes))
+        {
+            return; // wait for the next KV_CREDIT
+        }
+        UbKvHeader kv;
+        kv.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_DATA));
+        kv.SetVl(push.vl);
+        kv.SetLength(frameBytes);
+        kv.SetTaskId(taskId);
+        kv.SetOffset(push.offset);
+        kv.SetSeq(push.offset / 4096);
+        if (!EnqueueKvFrame(port, push.dstNode, push.vl, kv, frameBytes))
+        {
+            Simulator::Schedule(MicroSeconds(1), &UbApp::PumpKvPush, this, taskId);
+            return;
+        }
+                credit -= static_cast<int64_t>(frameBytes);
+        push.offset += frameBytes;
+        push.remaining -= frameBytes;
+    }
+    // Whole WQE pushed: notify the NPU (completion signal) and free the push slot.
+    UbKvHeader done;
+    done.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_DONE));
+    done.SetVl(push.vl);
+    done.SetTaskId(taskId);
+    done.SetLength(0);
+    EnqueueKvFrame(port, push.dstNode, push.vl, done, 0);
+    m_kvPushTasks.erase(it);
 }
 
 } // namespace ns3

@@ -119,6 +119,7 @@ global UB_CC_DISABLED_NODES "{cc_disabled_nodes}"
 global UB_UNION_STATIC_INGRESS_MAP "{union_static_map}"
 # Per-WQE 1825 pull: token-gated WQE starts + unbound 1815e-side CBFC credit.
 global UB_PULL_MODE "{pull_mode}"
+global UB_KV_PUSH_MODE "{kv_push_mode}"
 default ns3::UbDpu::PullMode "{pull_mode}"
 # Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side);
 # RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults above.
@@ -389,6 +390,10 @@ def main(argv):
                    help="union-only channelized lane map 'inPort:outPort,...', e.g. "
                         "'0:4,1:4,2:5,3:5' (ASU ports 0,1 fixed to gateway egress 4; 2,3 to 5). "
                         "Replaces per-flow ECMP on the bus union; empty = ECMP (default).")
+    p.add_argument("--kv-proto", default="urma", choices=["urma", "push"],
+                   help="request/data protocol: 'urma' = existing CTP READ transaction model; "
+                        "'push' = UB-top KV-push protocol (one READ request per WQE, ASU "
+                        "actively pushes data, 1825 push credits)")
     p.add_argument("--pull-mode", action="store_true",
                    help="per-WQE 1825 pull: the 1825 grants CTP_PULL tokens to ASUs (one WQE "
                         "per token, re-issued once the granted WQE's data fully crosses the "
@@ -594,6 +599,7 @@ def main(argv):
                                                   cc_disabled_nodes=args.cc_disabled_nodes,
                                                   union_static_map=args.union_static_map,
                                                   pull_mode="true" if args.pull_mode else "false",
+                                                  kv_push_mode="true" if args.kv_proto == "push" else "false",
                                                   ssd_read_latency=args.ssd_read_latency,
                                                   ssd_write_latency=args.ssd_write_latency,
                                                   ssd_bandwidth=scale_bandwidth(args.ssd_bandwidth,

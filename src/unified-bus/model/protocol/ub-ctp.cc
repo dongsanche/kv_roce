@@ -2149,6 +2149,27 @@ UbCtpTransportService::RegisterQueueIfNeeded(Ptr<UbCtpTxQueue> queue,
 }
 
 bool
+UbCtpTransportService::SendRawFrame(Ptr<Packet> packet, uint32_t outPort, uint8_t vl)
+{
+    if (m_node == nullptr || packet == nullptr)
+    {
+        return false;
+    }
+    Ptr<UbPort> port = DynamicCast<UbPort>(m_node->GetDevice(outPort));
+    if (port == nullptr)
+    {
+        return false;
+    }
+    UbCtpEntityKey queueKey;
+    queueKey.vl = vl;
+    Ptr<UbCtpTxQueue> queue = GetOrCreateQueue(queueKey, outPort, vl);
+    RegisterQueueIfNeeded(queue, outPort, vl);
+    queue->EnqueueData(packet);
+    port->TriggerTransmit();
+        return true;
+}
+
+bool
 UbCtpTransportService::SendResponseSegment(Ptr<UbWqeSegment> response, UbCtpEntityState& state)
 {
     NS_ABORT_MSG_IF(response == nullptr, "CTP response send requires WQE segment");

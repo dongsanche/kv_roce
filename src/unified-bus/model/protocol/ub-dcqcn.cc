@@ -814,7 +814,8 @@ UbSwitchDcqcn::MaybeMarkPacket(uint32_t outPort, Ptr<Packet> p)
         p->AddHeader(cnaHeader);
         p->AddHeader(dlPacketHeader);
     };
-    if (cnaHeader.GetNlp() != UB_CNA_NLP_CTPH)
+    const uint8_t nlp = cnaHeader.GetNlp();
+    if (nlp != UB_CNA_NLP_CTPH && nlp != UB_CNA_NLP_KVPUSH)
     {
         restoreHeaders();
         return;

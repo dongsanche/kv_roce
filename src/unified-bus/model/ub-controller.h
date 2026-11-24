@@ -37,6 +37,26 @@ class UbPort;
  */
 class UbController : public Object {
 public:
+    /**
+     * @brief KV-push protocol sink at the responder: READ request -> SSD read -> active push;
+     * KV_CREDIT refills the push credit. Frames are delivered by the switch when the node has
+     * no application (e.g. an ASU, which only runs the controller).
+     */
+    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId);
+    struct KvPushTask
+    {
+        uint32_t taskId{0};
+        uint32_t dstNode{0};
+        uint8_t vl{0};
+        uint64_t remaining{0};
+        uint32_t offset{0};
+    };
+    void StartKvPush(uint32_t taskId);
+    void PumpKvPush(uint32_t taskId);
+    Ptr<UbPort> FirstKvUbPort() const;
+    std::map<uint32_t, KvPushTask> m_kvPushTasks;
+    std::map<std::pair<uint32_t, uint32_t>, int64_t> m_kvPushCredits;
+
     static TypeId GetTypeId();
 
     UbController();

@@ -35,6 +35,14 @@ public:
     void SendTrafficForTest(TrafficRecord record);
     void SendCtpUrmaTraffic(TrafficRecord record);
     void SendCtpUrmaTraffic(UbTrafficGen::RuntimeTask task);
+
+    /**
+     * @brief KV-push protocol frame sink (called by the switch for locally-addressed frames).
+     *
+     * Roles are implicit: at the ASU a KV_READ_REQ triggers the SSD read and the active push;
+     * at the NPU KV_DATA/KV_DONE complete the task; KV_CREDIT refills the per-flow push credit.
+     */
+    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId);
     Ptr<UbJetty> GetOrCreateCtpBoundJetty(uint32_t sourceNode,
                                           uint32_t destNode,
                                           uint32_t srcEntityId,
@@ -149,6 +157,27 @@ private:
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint8_t>, uint32_t>
         m_ctpBoundJettyByFullKey;
     std::map<std::tuple<uint32_t, uint32_t, uint8_t>, uint32_t> m_ctpUnboundJettyBySourceEntityVl;
+
+    // ---- KV-push protocol (UB-top simple header, NLP=0x5) ----
+    struct KvPushTask
+    {
+        uint32_t taskId{0};
+        uint32_t dstNode{0};
+        uint8_t vl{0};
+        uint64_t remaining{0};
+        uint32_t offset{0};
+    };
+    void SendKvReadRequest(const UbTrafficGen::RuntimeTask& task);
+    void StartKvPush(uint32_t taskId);
+    void PumpKvPush(uint32_t taskId);
+    bool EnqueueKvFrame(Ptr<UbPort> port, uint32_t dstNode, uint8_t vl, const UbKvHeader& kv,
+                        uint32_t payloadBytes);
+    Ptr<UbPort> FirstUbPort() const;
+    std::map<uint32_t, KvPushTask> m_kvPushTasks;                          // ASU side
+    std::map<std::pair<uint32_t, uint32_t>, int64_t> m_kvPushCredits;      // (peer, vl) -> bytes
+    std::map<uint32_t, uint64_t> m_kvRxBytes;                              // NPU side
+    std::map<uint32_t, uint64_t> m_kvRxExpected;
+    std::set<uint32_t> m_kvCompleted;
 
     Ptr<Node> m_node;              // 当前节点
 

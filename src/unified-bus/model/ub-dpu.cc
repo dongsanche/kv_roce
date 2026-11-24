@@ -692,7 +692,9 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
         }
         if (m_pullMode)
         {
-            flow.pullOutstandingBytes -= front.packet->GetSize();
+            flow.pullOutstandingBytes = flow.pullOutstandingBytes > front.packet->GetSize()
+                                            ? flow.pullOutstandingBytes - front.packet->GetSize()
+                                            : 0;
         }
         flow.pendingControl.pop();
         sent = true;
@@ -727,7 +729,19 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
         // re-opens (doorbell re-fires after this loop).
         if (m_pullMode)
         {
-            flow.pullOutstandingBytes -= front.packet->GetSize();
+            flow.pullOutstandingBytes = flow.pullOutstandingBytes > front.packet->GetSize()
+                                            ? flow.pullOutstandingBytes - front.packet->GetSize()
+                                            : 0;
+        }
+        if (flow.kvPushActive)
+        {
+            // KV push: return consumed bytes to the ASU in batches (>=64KB) so it can push more.
+            flow.kvCreditAccum += front.packet->GetSize();
+            if (flow.kvCreditAccum >= 64 * 1024)
+            {
+                SendKvCredit(key, flow.kvCreditAccum, front.inPortId);
+                flow.kvCreditAccum = 0;
+            }
         }
         const double seconds =
             static_cast<double>(front.packet->GetSize()) * 8.0 / static_cast<double>(rateBps);
@@ -744,6 +758,155 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
         // Data left the flow: the pull window opened, doorbell queued requests again.
         TryDoorbell(key);
     }
+}
+
+bool
+UbDpu::DirectForwardKvFrame(Ptr<Packet> packet, uint32_t inPort, uint32_t outPort)
+{
+    static const bool kvPush = []() {
+        BooleanValue enabled;
+        return GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", enabled) && enabled.Get();
+    }();
+    if (!kvPush)
+    {
+        return false;
+    }
+        Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr)
+    {
+        return false;
+    }
+    Ptr<Packet> view = packet->Copy();
+    UbDatalinkPacketHeader dlHeader;
+    UbCna16NetworkHeader cnaHeader;
+    UbKvHeader kvHeader;
+    view->RemoveHeader(dlHeader);
+    view->RemoveHeader(cnaHeader);
+    view->RemoveHeader(kvHeader);
+    const uint8_t vl = dlHeader.GetPacketVL();
+    const uint32_t dcna = utils::Cna16ToNodeId(cnaHeader.GetDcna());
+    const uint32_t scna = utils::Cna16ToNodeId(cnaHeader.GetScna());
+
+    if (IsRoceSide(inPort))
+    {
+        // NPU -> ASU request: the flow key is {ASU, NPU, vl} (ASU = destination CNA).
+        const DpuFlowKey key{dcna, scna, vl};
+        DpuFlowState& flow = GetOrCreateFlowState(key);
+        // NPU -> ASU: the READ request enters the 1825 request queue and is doorbelled
+        // (one active push per flow; the push credits pace the data, not the request).
+        if (kvHeader.GetOpcode() != static_cast<uint8_t>(KvOpcode::KV_READ_REQ))
+        {
+            return false;
+        }
+        if (flow.pendingRequests.size() >= m_pullRequestQueueCap)
+        {
+            ++flow.pullRequestDrops;
+            utils::UbUtils::RecordRuntimePacketDrop("1825 KV request queue full");
+            return true;
+        }
+        flow.pendingRequests.push(PendingPacket{packet, outPort});
+        TryKvDoorbell(key);
+        return true;
+    }
+    if (IsPortCbfc(inPort))
+    {
+        // ASU -> NPU: the flow key is again {ASU, NPU, vl} (ASU = source CNA here).
+        const DpuFlowKey key{scna, dcna, vl};
+        DpuFlowState& flow = GetOrCreateFlowState(key);
+        // Push data (forward via the per-flow QP) or the WQE-done marker.
+        if (kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DATA))
+        {
+            flow.roceOutPort = outPort;
+            flow.pending.push(PendingPacket{packet, inPort});
+            TrySendQp(key);
+            if (!m_retryEvent.IsPending())
+            {
+                m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
+            }
+            return true;
+        }
+        if (kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DONE))
+        {
+            flow.pending.push(PendingPacket{packet, inPort});
+            TrySendQp(key);
+            flow.kvPushActive = false;
+            if (flow.kvCreditAccum > 0)
+            {
+                SendKvCredit(key, flow.kvCreditAccum, inPort);
+                flow.kvCreditAccum = 0;
+            }
+            TryKvDoorbell(key);
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+void
+UbDpu::TryKvDoorbell(const DpuFlowKey& key)
+{
+    DpuFlowState& flow = GetOrCreateFlowState(key);
+    if (flow.kvPushActive || flow.pendingRequests.empty())
+    {
+        return;
+    }
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr)
+    {
+        return;
+    }
+    const PendingPacket& front = flow.pendingRequests.front();
+    const uint32_t ubPort = front.inPortId;
+    Ptr<UbPort> outDev = DynamicCast<UbPort>(node->GetDevice(ubPort));
+    if (outDev == nullptr)
+    {
+        return;
+    }
+    if (!outDev->EnqueueToEgress(std::make_tuple(ubPort, key.vl, front.packet)))
+    {
+        return;
+    }
+    outDev->TriggerTransmit();
+    flow.pendingRequests.pop();
+    flow.kvPushActive = true;
+    flow.kvCreditAccum = 0;
+    // Initial push window: the ASU may push this many bytes before waiting for credits.
+    SendKvCredit(key, m_pullWindowBytes, ubPort);
+}
+
+void
+UbDpu::SendKvCredit(const DpuFlowKey& key, uint64_t bytes, uint32_t ubPort)
+{
+    if (bytes == 0)
+    {
+        return;
+    }
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr || !IsUbSide(ubPort))
+    {
+        return;
+    }
+    Ptr<Packet> packet = Create<Packet>();
+    UbKvHeader kvHeader;
+    kvHeader.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_CREDIT));
+    kvHeader.SetVl(key.vl);
+    kvHeader.SetKvAddr(bytes); // credit bytes travel in the 64-bit address field
+    packet->AddHeader(kvHeader);
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(key.destinationNodeId)));
+    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(key.sourceNodeId)));
+    cnaHeader.SetServiceLevel(key.vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_KVPUSH);
+    packet->AddHeader(cnaHeader);
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                key.vl,
+                                key.vl,
+                                RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+    SendPacket(packet, ubPort, ubPort, key.vl);
 }
 
 void

@@ -759,6 +759,79 @@ uint8_t UbIpBasedNetworkHeader::GetFecn() const
  * UbCtpHeader implementation
  ***************************************************
  */
+TypeId
+UbKvHeader::GetTypeId(void)
+{
+    static TypeId tid = TypeId("ns3::UbKvHeader")
+                            .SetParent<Header>()
+                            .SetGroupName("UnifiedBus")
+                            .AddConstructor<UbKvHeader>();
+    return tid;
+}
+
+TypeId
+UbKvHeader::GetInstanceTypeId(void) const
+{
+    return GetTypeId();
+}
+
+void
+UbKvHeader::Print(std::ostream& os) const
+{
+    os << "KV opcode=" << static_cast<uint32_t>(m_opcode)
+       << " vl=" << static_cast<uint32_t>(m_vl) << " len=" << m_length
+       << " task=" << m_taskId << " addr=" << m_kvAddr << " off=" << m_offset
+       << " seq=" << m_seq;
+}
+
+uint32_t
+UbKvHeader::GetSerializedSize(void) const
+{
+    return 28;
+}
+
+void
+UbKvHeader::Serialize(Buffer::Iterator start) const
+{
+    start.WriteU8(m_opcode);
+    start.WriteU8(m_vl);
+    start.WriteHtonU16(0);
+    start.WriteHtonU32(m_length);
+    start.WriteHtonU32(m_taskId);
+    start.WriteHtonU64(m_kvAddr);
+    start.WriteHtonU32(m_offset);
+    start.WriteHtonU32(m_seq);
+}
+
+uint32_t
+UbKvHeader::Deserialize(Buffer::Iterator start)
+{
+    m_opcode = start.ReadU8();
+    m_vl = start.ReadU8();
+    (void)start.ReadNtohU16();
+    m_length = start.ReadNtohU32();
+    m_taskId = start.ReadNtohU32();
+    m_kvAddr = start.ReadNtohU64();
+    m_offset = start.ReadNtohU32();
+    m_seq = start.ReadNtohU32();
+    return GetSerializedSize();
+}
+
+void UbKvHeader::SetOpcode(uint8_t opcode) { m_opcode = opcode; }
+void UbKvHeader::SetVl(uint8_t vl) { m_vl = vl; }
+void UbKvHeader::SetLength(uint32_t length) { m_length = length; }
+void UbKvHeader::SetTaskId(uint32_t taskId) { m_taskId = taskId; }
+void UbKvHeader::SetKvAddr(uint64_t kvAddr) { m_kvAddr = kvAddr; }
+void UbKvHeader::SetOffset(uint32_t offset) { m_offset = offset; }
+void UbKvHeader::SetSeq(uint32_t seq) { m_seq = seq; }
+uint8_t UbKvHeader::GetOpcode() const { return m_opcode; }
+uint8_t UbKvHeader::GetVl() const { return m_vl; }
+uint32_t UbKvHeader::GetLength() const { return m_length; }
+uint32_t UbKvHeader::GetTaskId() const { return m_taskId; }
+uint64_t UbKvHeader::GetKvAddr() const { return m_kvAddr; }
+uint32_t UbKvHeader::GetOffset() const { return m_offset; }
+uint32_t UbKvHeader::GetSeq() const { return m_seq; }
+
 UbCtpHeader::UbCtpHeader() = default;
 
 UbCtpHeader::~UbCtpHeader() = default;

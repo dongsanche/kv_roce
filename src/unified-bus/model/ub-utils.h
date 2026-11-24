@@ -611,6 +611,14 @@ private:
     // real architecture; the binding flow control is the 1825's per-WQE pull tokens. The
     // union->1825 credit return (forward-success-only) is kept as the 1825 pull speed at
     // packet granularity.
+    // KV-push protocol master switch (UB-top simple header, NLP=0x5): the NPU sends one READ
+    // request per WQE and the ASU actively pushes the data, paced by 1825 push credits.
+    ns3::GlobalValue g_kv_push_mode =
+        ns3::GlobalValue("UB_KV_PUSH_MODE",
+                         "Enable the simulator-local KV-push protocol (UB-top simple header).",
+                         ns3::BooleanValue(false),
+                         ns3::MakeBooleanChecker());
+
     ns3::GlobalValue g_pull_mode =
         ns3::GlobalValue("UB_PULL_MODE",
                          "Enable per-WQE 1825 pull (also unbounds 1815e-side CBFC credit).",

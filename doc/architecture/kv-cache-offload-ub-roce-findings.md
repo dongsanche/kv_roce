@@ -829,3 +829,41 @@ pull+CC 开（CNP 风暴 pacing 债务冻结）仍为 CC 侧老病（19.13 第 1
 验证：pull+no-cc 8/8 完成、0 丢包、per-task mean 1953µs（修复前 1961µs，性能无损）。
 现在的完整不变量：每流 在途请求承诺 + 数据 ≤ 1MB 窗口；请求队列 ≤ 4096 包；
 union 在途 ≤ 窗口 × 流数（≤ 12.5MB pool，自洽）。
+
+
+### 19.17 KV-push 协议（UB 之上的简单自定义包头，跑通）
+
+按用户定义实现（`--kv-proto push`，`UB_KV_PUSH_MODE` global）：NPU 每任务发**一条**读请求
+（`KV_READ_REQ{kvAddr,length,taskId}`，40B），ASU 收到后**主动推送**数据（4KB `KV_DATA` 帧
+流），1825 按转发进度回 `KV_CREDIT`，NPU 收齐 `length` 字节即完成。协议帧 = UB CNA16 +
+NLP=0x5（模拟器本地值，LDST_BYPASS=0x4 先例）+ 28B `UbKvHeader`（opcode/vl/length32/
+taskId/addr/offset/seq），**无 PSN/重传**（UB 无损 + 信用流控保证）。
+
+实现要点：
+- 请求：NPU app 每任务 1 包（对比 CTP 模式 2048 包/8MB，请求开销 1.1%→0.002%）
+- 推送：ASU 侧 push 引擎在 **UbController**（ASU 无 UbApp，controller 是接收方）
+- 1825：请求队列+doorbell（`kvPushActive` 每流一次一个 WQE）+ 转发即回信用（64KB 批）
+- union：KV 帧与 CTP 同等 per-NL ECN 打标；**默认 Kmin 即自然触发**（实测 14816 次，
+  因推送流在 1MB 窗口内突发成驻留，union 出口排队超 5120B）
+- 发送路径：设备侧走 CTP 的 per-(port,VL) TX 队列（allocator 驱动），设备无路由表
+  → KV 帧本地投递优先于路由解析
+
+实测（8×8MB incast，pull 架构 + 固定映射）：
+
+| 指标 | KV-push | CTP pull 基线 |
+|---|---|---|
+| 任务完成 | 8/8，0 丢包 | 8/8，0 丢包 |
+| 聚合吞吐 | **147 Gbps（73%）** | 182 Gbps（91%） |
+| 请求数 | **8 个** | 16384 个 |
+| union 打标 | 14816（默认 Kmin） | 0（无驻留） |
+
+差距分析（147 vs 182）：初始窗口 1MB/流 + 信用 64KB 批回 + 每流 WQE 串行
+（DONE→下一请求 doorbell 的空档）——可用更大窗口/更小信用批/请求流水化收窄。
+
+调试中修掉的 bug（对后续有用）：① 设备节点无路由表 → KV 本地投递必须先于路由；
+② HandleKvPacket 已剥 KV 头，接收方二次剥头读到垃圾 opcode（双剥头）；③ DPU flow key
+在 RoCE→UB 和 UB→RoCE 两个方向的 scna/dcna 语义相反（{ASU,NPU} 位置反了 → 数据帧查错
+flow state → 信用永不回 → 推送停摆）。
+
+已知限制：KV 路径绕过 WQE 机制，`task_statistics.csv` 完成时间列为空、TaskTrace 无记录；
+性能口径用 PortTrace（NPU 首帧到末帧）。

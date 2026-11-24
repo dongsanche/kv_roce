@@ -210,6 +210,14 @@ class UbCtpTransportService : public Object
                               uint32_t outPort,
                               uint32_t priority);
     bool SendResponseSegmentForTest(Ptr<UbWqeSegment> response, const UbCtpEntityKey& key);
+
+    /**
+     * @brief Send a pre-built packet through the per-(port,VL) TX queue (allocator-driven).
+     *
+     * Used by the simulator-local KV-push protocol; the packet already carries its own
+     * datalink/CNA/KV headers.
+     */
+    bool SendRawFrame(Ptr<Packet> packet, uint32_t outPort, uint8_t vl);
     uint32_t GetQueuedPacketCountForTest(const UbCtpEntityKey& key) const;
     uint32_t GetQueuedPacketCountForTest(const UbCtpEntityKey& key,
                                          uint32_t outPort,
@@ -265,6 +273,7 @@ class UbCtpTransportService : public Object
                                      Ptr<UbWqeSegment> response,
                                      uint64_t token);
     bool SendResponseSegment(Ptr<UbWqeSegment> response, UbCtpEntityState& state);
+
     void CompleteFromTaAck(const UbCtpEntityKey& key,
                            uint32_t taSsn,
                            Ptr<UbWqeSegment> response);

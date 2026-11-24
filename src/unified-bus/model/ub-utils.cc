@@ -1958,7 +1958,7 @@ void
 UbUtils::RecordRuntimePacketDrop(const std::string& reason)
 {
     std::lock_guard<std::mutex> guard(runtime_drop_mutex);
-    ++runtime_packet_drop_count;
+        ++runtime_packet_drop_count;
     if (runtime_packet_drop_reason.empty())
     {
         runtime_packet_drop_reason = reason;

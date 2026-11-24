@@ -462,6 +462,16 @@ constexpr uint8_t UB_CNA_NLP_CTPH = 0x0;
 constexpr uint8_t UB_CNA_NLP_RTPH = 0x2;
 // Simulator-local CFG7 compact LDST TP bypass extension (not a standard NLP).
 constexpr uint8_t UB_CNA_NLP_LDST_BYPASS = 0x4;
+// Simulator-local KV-push protocol (not a standard NLP): a simple UB-top header for
+// NPU-read-request + ASU-active-push flows (see ub-header.h UbKvHeader).
+constexpr uint8_t UB_CNA_NLP_KVPUSH = 0x5;
+
+enum class KvOpcode : uint8_t {
+    KV_READ_REQ = 0, // NPU -> ASU: {kvAddr, length, taskId} -- one packet per WQE
+    KV_DATA = 1,     // ASU -> NPU: 4KB push frame {offset, length, taskId}
+    KV_CREDIT = 2,   // 1825 -> ASU: push credit in bytes (returned per forwarded data)
+    KV_DONE = 3,     // ASU -> NPU: whole WQE pushed {taskId}
+};
 constexpr uint8_t UB_CTPH_NLP_COMPACT_TAH = 0x0;
 constexpr uint8_t UB_CTPH_NLP_UPI32_EID128_TAH = 0x1;
 constexpr uint8_t UB_CTPH_NLP_UPI16_EID40_TAH = 0x2;

@@ -119,6 +119,9 @@ class UbDpu : public UbSwitch
         // below PullWindowBytes -- the 1825's pull speed, which bounds the union buffer.
         std::queue<PendingPacket> pendingRequests;
         uint64_t pullOutstandingBytes{0};
+        // KV-push protocol state: one active push (WQE) per flow; per-forward credit return.
+        bool kvPushActive{false};
+        uint64_t kvCreditAccum{0};
         // Response bytes already promised by doorbelled requests whose data has not arrived
         // yet. Without it, an emptied window dumps the whole request backlog in one burst and
         // the 4KB-per-request response flood bypasses the pull window.
@@ -132,6 +135,9 @@ class UbDpu : public UbSwitch
     void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
     void SendCutCnp(const DpuFlowKey& key);
     void TryDoorbell(const DpuFlowKey& key);
+    bool DirectForwardKvFrame(Ptr<Packet> packet, uint32_t inPort, uint32_t outPort) override;
+    void TryKvDoorbell(const DpuFlowKey& key);
+    void SendKvCredit(const DpuFlowKey& key, uint64_t bytes, uint32_t ubPort);
     bool IsRoceVlPaused(uint32_t portId, uint8_t vl) const;
     void TrySendQp(const DpuFlowKey& key);
     void RetryHeldFlows();

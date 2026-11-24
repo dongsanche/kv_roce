@@ -44,6 +44,7 @@ typedef enum {
     UB_URMA_DATA_PACKET,
     UB_LDST_DATA_PACKET,
     UB_CTP_DATA_PACKET,
+    UB_KV_PACKET,
     UB_LAST_ACK_PACKET,
     UNKOWN_TYPE
 } UbPacketType_t;
@@ -278,6 +279,19 @@ protected:
         return false;
     }
 
+    /**
+     * @brief Gateway (1825) KV-push interception: request doorbell/credits/accounting.
+     *
+     * Default no-op for plain switches; UbDpu overrides. Returns true when the DPU consumed
+     * or forwarded the frame (the caller must not forward it again).
+     */
+    virtual bool DirectForwardKvFrame(Ptr<Packet> packet,
+                                      uint32_t inPort,
+                                      uint32_t outPort)
+    {
+        return false;
+    }
+
 private:
     struct BufferOverrideConfig {
         std::optional<uint32_t> reservePerQueueBytes;
@@ -352,6 +366,7 @@ private:
     void HandleURMADataPacket(Ptr<UbPort> port, Ptr<Packet> packet);
     void HandleLdstDataPacket(Ptr<UbPort> port, Ptr<Packet> packet);
     void HandleCtpDataPacket(Ptr<UbPort> port, Ptr<Packet> packet);
+    void HandleKvPacket(Ptr<UbPort> port, Ptr<Packet> packet);
     bool SinkTpDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const ParsedURMAHeaders &headers);
     bool SinkLdstDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const ParsedLdstHeaders &headers);
     bool SinkCtpDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const ParsedCtpHeaders &headers);

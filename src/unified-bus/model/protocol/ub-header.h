@@ -1321,6 +1321,49 @@ private:
     static const uint32_t totalHeaderSize = 1;     // 总头部大小 (1字节)
 };
 
+
+/**
+ * \ingroup ub-header
+ * \brief Simulator-local KV-push protocol header (24B, UB_CNA_NLP_KVPUSH).
+ *
+ * Sits on top of the UB CNA16 network header. No PSN / retransmission: the UB fabric is
+ * lossless and the 1825 push credits bound the in-flight data.
+ */
+class UbKvHeader : public Header
+{
+  public:
+    static TypeId GetTypeId(void);
+    TypeId GetInstanceTypeId(void) const override;
+    void Print(std::ostream& os) const override;
+    void Serialize(Buffer::Iterator start) const override;
+    uint32_t Deserialize(Buffer::Iterator start) override;
+    uint32_t GetSerializedSize(void) const override;
+
+    void SetOpcode(uint8_t opcode);
+    void SetVl(uint8_t vl);
+    void SetLength(uint32_t length);
+    void SetTaskId(uint32_t taskId);
+    void SetKvAddr(uint64_t kvAddr);
+    void SetOffset(uint32_t offset);
+    void SetSeq(uint32_t seq);
+    uint8_t GetOpcode() const;
+    uint8_t GetVl() const;
+    uint32_t GetLength() const;
+    uint32_t GetTaskId() const;
+    uint64_t GetKvAddr() const;
+    uint32_t GetOffset() const;
+    uint32_t GetSeq() const;
+
+  private:
+    uint8_t m_opcode{0};
+    uint8_t m_vl{0};
+    uint32_t m_length{0};
+    uint32_t m_taskId{0};
+    uint64_t m_kvAddr{0};
+    uint32_t m_offset{0};
+    uint32_t m_seq{0};
+};
+
 } // namespace ns3
 
 #endif /* UB_HEADER_H */

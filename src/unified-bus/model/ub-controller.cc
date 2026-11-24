@@ -795,4 +795,170 @@ UbController::SetCtpPacketTimingTraceCallbacks(CtpPacketTimingCallback firstPack
     }
 }
 
+// ============================ KV-push (responder side) ============================
+
+Ptr<UbPort>
+UbController::FirstKvUbPort() const
+{
+    Ptr<Node> node = GetObject<Node>();
+    if (node == nullptr)
+    {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < node->GetNDevices(); ++i)
+    {
+        Ptr<UbPort> port = DynamicCast<UbPort>(node->GetDevice(i));
+        if (port != nullptr)
+        {
+            return port;
+        }
+    }
+    return nullptr;
+}
+
+void
+UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId)
+{
+    if (frame == nullptr)
+    {
+        return;
+    }
+    UbKvHeader kv;
+    frame->RemoveHeader(kv);
+    const uint32_t taskId = kv.GetTaskId();
+    switch (static_cast<KvOpcode>(kv.GetOpcode()))
+    {
+    case KvOpcode::KV_READ_REQ:
+    {
+                KvPushTask push;
+        push.taskId = taskId;
+        push.dstNode = sourceNodeId;
+        push.vl = kv.GetVl();
+        push.remaining = kv.GetLength();
+        push.offset = 0;
+        m_kvPushTasks[taskId] = push;
+        Ptr<UbSsd> ssd = GetUbSsd();
+        if (ssd != nullptr)
+        {
+            ssd->SubmitRead(taskId,
+                            kv.GetLength(),
+                            MakeCallback(&UbController::StartKvPush, this, taskId),
+                            true);
+        }
+        else
+        {
+            Simulator::Schedule(MicroSeconds(50), &UbController::StartKvPush, this, taskId);
+        }
+        break;
+    }
+    case KvOpcode::KV_CREDIT:
+    {
+                m_kvPushCredits[{sourceNodeId, kv.GetVl()}] += static_cast<int64_t>(kv.GetKvAddr());
+        std::vector<uint32_t> pending;
+        for (const auto& [id, push] : m_kvPushTasks)
+        {
+            if (push.dstNode == sourceNodeId && push.vl == kv.GetVl())
+            {
+                pending.push_back(id);
+            }
+        }
+        for (const uint32_t id : pending)
+        {
+            PumpKvPush(id);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void
+UbController::StartKvPush(uint32_t taskId)
+{
+    PumpKvPush(taskId);
+}
+
+void
+UbController::PumpKvPush(uint32_t taskId)
+{
+    const auto it = m_kvPushTasks.find(taskId);
+    if (it == m_kvPushTasks.end())
+    {
+        return;
+    }
+    KvPushTask& push = it->second;
+    Ptr<UbPort> port = FirstKvUbPort();
+    if (port == nullptr)
+    {
+        return;
+    }
+    Ptr<UbCtpTransportService> service = GetCtpTransportService();
+    if (service == nullptr)
+    {
+        return;
+    }
+    int64_t& credit = m_kvPushCredits[{push.dstNode, push.vl}];
+    Ptr<Node> node = GetObject<Node>();
+    while (push.remaining > 0)
+    {
+        const uint32_t frameBytes = static_cast<uint32_t>(std::min<uint64_t>(push.remaining, 4096));
+        if (credit < static_cast<int64_t>(frameBytes))
+        {
+            return; // wait for the next KV_CREDIT
+        }
+        UbKvHeader kv;
+        kv.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_DATA));
+        kv.SetVl(push.vl);
+        kv.SetLength(frameBytes);
+        kv.SetTaskId(taskId);
+        kv.SetOffset(push.offset);
+        kv.SetSeq(push.offset / 4096);
+        Ptr<Packet> packet = Create<Packet>(frameBytes);
+        packet->AddHeader(kv);
+        UbCna16NetworkHeader cnaHeader;
+        cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(node->GetId())));
+        cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(push.dstNode)));
+        cnaHeader.SetServiceLevel(push.vl);
+        cnaHeader.SetNlp(UB_CNA_NLP_KVPUSH);
+        packet->AddHeader(cnaHeader);
+        UbDataLink::AddPacketHeader(packet,
+                                    false,
+                                    false,
+                                    push.vl,
+                                    push.vl,
+                                    RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                    UbDatalinkHeaderConfig::PACKET_CNA16);
+        if (!service->SendRawFrame(packet, port->GetIfIndex(), push.vl))
+        {
+            Simulator::Schedule(MicroSeconds(1), &UbController::PumpKvPush, this, taskId);
+            return;
+        }
+                credit -= static_cast<int64_t>(frameBytes);
+        push.offset += frameBytes;
+        push.remaining -= frameBytes;
+    }
+    UbKvHeader done;
+    done.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_DONE));
+    done.SetVl(push.vl);
+    done.SetTaskId(taskId);
+    Ptr<Packet> packet = Create<Packet>(0);
+    packet->AddHeader(done);
+    UbCna16NetworkHeader cnaHeader;
+    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(node->GetId())));
+    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(push.dstNode)));
+    cnaHeader.SetServiceLevel(push.vl);
+    cnaHeader.SetNlp(UB_CNA_NLP_KVPUSH);
+    packet->AddHeader(cnaHeader);
+    UbDataLink::AddPacketHeader(packet,
+                                false,
+                                false,
+                                push.vl,
+                                push.vl,
+                                RoutingType::PER_FLOW_SHORTEST_PATHS,
+                                UbDatalinkHeaderConfig::PACKET_CNA16);
+    service->SendRawFrame(packet, port->GetIfIndex(), push.vl);
+    m_kvPushTasks.erase(it);
+}
+
 } // namespace ns3

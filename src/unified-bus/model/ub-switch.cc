@@ -50,7 +50,6 @@ Cna24ToRoutingPortId(uint32_t cna)
 
 } // namespace
 
-
 /*-----------------------------------------UbSwitchNode----------------------------------------------*/
 
 TypeId UbSwitch::GetTypeId (void)
@@ -703,6 +702,9 @@ UbPacketType_t UbSwitch::GetPacketType(Ptr<Packet> packet)
         if (cna16Header.GetNlp() == UB_CNA_NLP_CTPH) {
             return UB_CTP_DATA_PACKET;
         }
+        if (cna16Header.GetNlp() == UB_CNA_NLP_KVPUSH) {
+            return UB_KV_PACKET;
+        }
         return UB_LDST_DATA_PACKET;
     }
     if (dlHeader.GetConfig() == static_cast<uint8_t>(UbDatalinkHeaderConfig::PACKET_CNA24)) {
@@ -730,7 +732,7 @@ void UbSwitch::SwitchHandlePacket(Ptr<UbPort> port, Ptr<Packet> packet)
 {
     // 帧类型判断
     auto packetType = GetPacketType(packet);
-    switch (packetType) {
+            switch (packetType) {
         case UB_LAST_ACK_PACKET:
             HandleLastAck(port, packet);
             break;
@@ -755,9 +757,91 @@ void UbSwitch::SwitchHandlePacket(Ptr<UbPort> port, Ptr<Packet> packet)
             }
             HandleCtpDataPacket(port, packet);
             break;
+        case UB_KV_PACKET:
+            if (IsPortCbfc(port->GetIfIndex())) {
+                port->GetFlowControl()->OnDataPacketReceived(packet);
+            }
+            HandleKvPacket(port, packet);
+            break;
         default:
             NS_ASSERT_MSG(0, "Invalid Packet Type!");
     }
+}
+
+/**
+ * @brief Handle KV-push protocol frame (UB-top simple header, NLP=0x5).
+ *
+ * Routing is by the CNA16 destination node (like the LDST bypass). The gateway (1825)
+ * intercepts for the request doorbell / push credits / accounting; a device node hands the
+ * frame to its local UbApp (READ_REQ at the ASU, DATA/DONE/CREDIT at the NPU/ASU).
+ */
+void
+UbSwitch::HandleKvPacket(Ptr<UbPort> port, Ptr<Packet> packet)
+{
+    const uint32_t inPort = port->GetIfIndex();
+    // The view handed to the local receiver keeps the KV header (the app/controller strips
+    // it); route/diagnostic parsing uses a throwaway copy.
+    Ptr<Packet> view = CopyPacketView(packet);
+    UbDatalinkPacketHeader dlHeader;
+    UbCna16NetworkHeader cnaHeader;
+    view->RemoveHeader(dlHeader);
+    view->RemoveHeader(cnaHeader);
+    UbKvHeader kvHeader;
+    {
+        Ptr<Packet> kvView = CopyPacketView(view);
+        kvView->RemoveHeader(kvHeader);
+    }
+    const uint32_t dstNodeId = utils::Cna16ToNodeId(cnaHeader.GetDcna());
+    Ptr<Node> node = GetObject<Node>();
+    {
+        const uint32_t dbgNode = node != nullptr ? node->GetId() : 999999;
+        if (dbgNode <= 3)
+        {
+        }
+    }
+
+    // Local delivery FIRST: device nodes carry no routing table, so a frame addressed to
+    // this node must never go through route resolution. Hand the frame (datalink/CNA
+    // stripped, KV header + payload intact) to the node's application (requester side) or
+    // to the controller (the responder/ASU runs only the controller).
+    if (node != nullptr && dstNodeId == node->GetId())
+    {
+        for (uint32_t i = 0; i < node->GetNApplications(); ++i)
+        {
+            Ptr<UbApp> app = DynamicCast<UbApp>(node->GetApplication(i));
+            if (app != nullptr)
+            {
+                app->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()));
+                return;
+            }
+        }
+        Ptr<UbController> controller = node->GetObject<UbController>();
+        if (controller != nullptr)
+        {
+            controller->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()));
+        }
+        return;
+    }
+
+    // Route by the destination node (same key style as the LDST bypass path).
+    RoutingKey rtKey;
+    rtKey.dip = utils::NodeIdToIp(dstNodeId).Get();
+    bool selectedShortestPath = false;
+    const int outPort =
+        m_routingProcess->GetOutPortAfterFailure(rtKey, selectedShortestPath, inPort, false);
+    if (outPort < 0)
+    {
+        ReportForwardingRouteFailure(rtKey, inPort);
+        return;
+    }
+
+    // Gateway (1825): doorbell/credits/accounting interception (no-op for plain switches).
+    if (DirectForwardKvFrame(packet, inPort, static_cast<uint32_t>(outPort)))
+    {
+        return;
+    }
+
+    SendPacket(packet, inPort, static_cast<uint32_t>(outPort), dlHeader.GetPacketVL());
 }
 
 /**
@@ -1346,7 +1430,7 @@ UbSwitch::ReportForwardingRouteFailure(const RoutingKey& key, uint32_t inPort)
                        << " (original-ingress exclusion and endpoint restrictions stay in effect)");
     }
     utils::UbUtils::RecordRuntimePacketDrop("route cannot be found");
-    NS_LOG_WARN("The route cannot be found. Packet Dropped!");
+        NS_LOG_WARN("The route cannot be found. Packet Dropped!");
 }
 
 void UbSwitch::ParseURMAPacketHeader(Ptr<Packet> packet, ParsedURMAHeaders &headers)
@@ -1964,7 +2048,6 @@ UbSwitch::SubmitRecoveryPacket(Ptr<Packet> packet,
                  << " oldOutput " << oldOutput << " newOutput " << newOutput);
     return UbRecoverySubmitResult::TRANSFERRED;
 }
-
 
 void
 UbSwitch::AbortNoRecoveryRoute(const RoutingKey& key,
