@@ -42,7 +42,7 @@ public:
      * KV_CREDIT refills the push credit. Frames are delivered by the switch when the node has
      * no application (e.g. an ASU, which only runs the controller).
      */
-    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId);
+    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t inPort);
     struct KvPushTask
     {
         uint32_t taskId{0};
@@ -50,6 +50,8 @@ public:
         uint8_t vl{0};
         uint64_t remaining{0};
         uint32_t offset{0};
+        uint32_t ubPort{0}; // egress port the request arrived on: the push must use the same
+                           // gateway path, or the 1825 flow state splits across gateways.
     };
     void StartKvPush(uint32_t taskId);
     void PumpKvPush(uint32_t taskId);

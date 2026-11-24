@@ -659,6 +659,15 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
     // upstream ASU is backpressured rather than allowed to keep flooding the switch).
     if (IsRoceVlPaused(flow.roceOutPort, key.vl))
     {
+        static Time lastDbg;
+        if (Simulator::Now() - lastDbg > MicroSeconds(200))
+        {
+            lastDbg = Simulator::Now();
+            std::cerr << "[QDBG] t=" << Simulator::Now().GetMicroSeconds() << "us gw"
+                      << GetObject<Node>()->GetId() << " HELD asu=" << key.sourceNodeId
+                      << " npu=" << key.destinationNodeId << " vl=" << (uint32_t)key.vl
+                      << " pending=" << flow.pending.size() << std::endl;
+        }
         return;
     }
 

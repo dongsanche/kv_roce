@@ -792,7 +792,7 @@ UbApp::SendKvReadRequest(const UbTrafficGen::RuntimeTask& task)
 }
 
 void
-UbApp::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId)
+UbApp::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t inPort)
 {
     if (frame == nullptr)
     {

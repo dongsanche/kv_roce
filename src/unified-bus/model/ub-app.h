@@ -42,7 +42,7 @@ public:
      * Roles are implicit: at the ASU a KV_READ_REQ triggers the SSD read and the active push;
      * at the NPU KV_DATA/KV_DONE complete the task; KV_CREDIT refills the per-flow push credit.
      */
-    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId);
+    void HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t inPort);
     Ptr<UbJetty> GetOrCreateCtpBoundJetty(uint32_t sourceNode,
                                           uint32_t destNode,
                                           uint32_t srcEntityId,

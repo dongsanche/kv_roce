@@ -867,3 +867,40 @@ flow state → 信用永不回 → 推送停摆）。
 
 已知限制：KV 路径绕过 WQE 机制，`task_statistics.csv` 完成时间列为空、TaskTrace 无记录；
 性能口径用 PortTrace（NPU 首帧到末帧）。
+
+
+### 19.18 KV-push 正确架构上的误打标四象限（B 实验）
+
+修正架构（固定 lane + doorbell + KV-push）上重跑 §19.11 的 multi-incast 受害实验：
+NPU0 组 6x8MB 重流（VL6），NPU1 组 2x8MB 受害（同 NL 臂 VL7 / 隔离臂 VL4），默认
+union 阈值（Kmin 5120），`--kv-proto push`。修好两个阻塞后两臂均 8/8 全量完成、0 丢包：
+
+| 指标 | A 同 NL (victim=VL7) | B 隔离 NL (victim=VL4) |
+|---|---|---|
+| union 误打（sibling>own） | **vl7: 190/226 (84%)**；vl6: 144/7553 | **0**（三个 VL 全 own-driven） |
+| 被误打时 own/sibling | vl7 own 128KB / sib 924KB | — |
+| victim 完成时间 | 715µs | 717µs |
+| 重流完成时间 | 2542µs | 2489µs |
+| 丢包 | 0 | 0 |
+
+**结论**：
+
+1. **NL 连坐在 KV-push 架构下同样真实**：A 臂 victim 84% 的 ECN 打标由重流 VL6 的
+   924KB 驻留驱动（own 仅 128KB），B 臂同 dynamics 下 0 误打——归因依然靠
+   `vl_backlog_bytes` 列（§19 机制在新架构完整重现）。
+2. **但伤害为零**：两臂 victim 完成时间完全一致（715 vs 717µs）。原因：KV-push
+   协议的推送节拍由 1825 信用窗口控制（结构流控），**FECN 没有任何消费路径**——
+   KV 帧没有 CNP 反馈环，误打标是无害观测信号。CTP 时代的"消费税"象限（§19.11
+   中 -57% 吞吐）在 KV-push 下结构性消失。
+3. **SP 饿死仍在**：A 臂 victim 数据也出现 own 驻留（128KB）——它和重流共 union5
+   出口竞争 + RoCE 侧 PFC，两个旧病仍影响公平性，与打标无关。
+4. 调试中修好的两个架构 bug（对多 NPU 部署关键，已随代码提交）：
+   - **push 出口必须跟随 REQ 入口**（`KvPushTask.ubPort`）：FirstUbPort 固定 p0 会让
+     REQ 走 gw7-union5 而 push 走 gw6-union4，flow 状态分裂跨网关 → 信用永不回 →
+     victim 窗口死锁。单 NPU 因路径收敛侥幸通过。
+   - **KV 帧本地投递必须先于路由解析**（设备节点无路由表）。
+
+设计含义：在 KV-push 这类"结构流控 + 无 CC 反馈"的协议上，union per-NL 聚合打标
+不构成性能风险（当前形态）；若未来要给 KV 流加 CC（如背压式或显式速率），A 臂的
+84% 误打率就是届时会被放大的隐患——per-VL own-backlog 归因打标（§19.9）仍是
+正确的预防性修法。

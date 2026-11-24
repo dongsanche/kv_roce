@@ -817,7 +817,7 @@ UbController::FirstKvUbPort() const
 }
 
 void
-UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId)
+UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t inPort)
 {
     if (frame == nullptr)
     {
@@ -836,6 +836,7 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId)
         push.vl = kv.GetVl();
         push.remaining = kv.GetLength();
         push.offset = 0;
+        push.ubPort = inPort;
         m_kvPushTasks[taskId] = push;
         Ptr<UbSsd> ssd = GetUbSsd();
         if (ssd != nullptr)
@@ -888,7 +889,15 @@ UbController::PumpKvPush(uint32_t taskId)
         return;
     }
     KvPushTask& push = it->second;
-    Ptr<UbPort> port = FirstKvUbPort();
+    Ptr<Node> node = GetObject<Node>();
+    Ptr<UbPort> port =
+        (push.ubPort < (node != nullptr ? node->GetNDevices() : 0))
+            ? DynamicCast<UbPort>(node->GetDevice(push.ubPort))
+            : nullptr;
+    if (port == nullptr)
+    {
+        port = FirstKvUbPort();
+    }
     if (port == nullptr)
     {
         return;
@@ -899,7 +908,6 @@ UbController::PumpKvPush(uint32_t taskId)
         return;
     }
     int64_t& credit = m_kvPushCredits[{push.dstNode, push.vl}];
-    Ptr<Node> node = GetObject<Node>();
     while (push.remaining > 0)
     {
         const uint32_t frameBytes = static_cast<uint32_t>(std::min<uint64_t>(push.remaining, 4096));

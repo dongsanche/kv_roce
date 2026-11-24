@@ -811,14 +811,14 @@ UbSwitch::HandleKvPacket(Ptr<UbPort> port, Ptr<Packet> packet)
             Ptr<UbApp> app = DynamicCast<UbApp>(node->GetApplication(i));
             if (app != nullptr)
             {
-                app->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()));
+                app->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()), inPort);
                 return;
             }
         }
         Ptr<UbController> controller = node->GetObject<UbController>();
         if (controller != nullptr)
         {
-            controller->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()));
+            controller->HandleKvFrame(view, utils::Cna16ToNodeId(cnaHeader.GetScna()), inPort);
         }
         return;
     }
