@@ -810,3 +810,22 @@ pull+CC 开（CNP 风暴 pacing 债务冻结）仍为 CC 侧老病（19.13 第 1
 架构现状（与用户确认真实硬件一致）：union = VOQ buffer + per-NL ECN 打标 + SP/DWRR；
 1825 = RoCE↔UB 转换 + 请求队列/主动 doorbell（PullWindowBytes=1MB 默认，门 = 在途数据
 < 窗口）；1815e = 无 CBFC credit，按 doorbell 请求生成响应。
+
+
+### 19.16 doorbell 窗口漏洞修复：请求配额 + 队列容量（回答"1825 会不会被打爆"）
+
+漏洞（用户指出）：原 doorbell 门只数 `outstanding = 已到达 − 已转发`，**已 doorbell 但
+响应未到的请求不占窗口**。RoCE 阻塞期间请求在 1825 请求队列堆积；窗口一腾空，doorbell
+一次性清空队列 → 1815e 同时生成 N 个响应 → N×4KB 数据洪峰绕过 1MB 窗口 → union/
+1825 pending 被打爆。且请求队列原本无界。
+
+修复（`PullWindowBytes` 语义扩展 + `PullRequestQueueCap`）：
+- `pullDoorbellReserved`：每 doorbell 一个请求段即预记 UB_MTU(4KB) 响应字节（实测
+  2048 请求段/8MB 读 = 1:1 段映射）；数据到达时结算（reserved −= 到达字节）。门变为
+  `outstanding + reserved < PullWindowBytes` → **在途（已放行请求 + 已到达数据）恒 ≤ 窗口**。
+- 请求队列上限 `PullRequestQueueCap`（默认 4096 包/flow）；超限丢包并计数
+  （`1825 request queue full`，真实设备语义为 NAK/扣 SQ credit）。
+
+验证：pull+no-cc 8/8 完成、0 丢包、per-task mean 1953µs（修复前 1961µs，性能无损）。
+现在的完整不变量：每流 在途请求承诺 + 数据 ≤ 1MB 窗口；请求队列 ≤ 4096 包；
+union 在途 ≤ 窗口 × 流数（≤ 12.5MB pool，自洽）。

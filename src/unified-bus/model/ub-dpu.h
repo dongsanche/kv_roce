@@ -119,6 +119,11 @@ class UbDpu : public UbSwitch
         // below PullWindowBytes -- the 1825's pull speed, which bounds the union buffer.
         std::queue<PendingPacket> pendingRequests;
         uint64_t pullOutstandingBytes{0};
+        // Response bytes already promised by doorbelled requests whose data has not arrived
+        // yet. Without it, an emptied window dumps the whole request backlog in one burst and
+        // the 4KB-per-request response flood bypasses the pull window.
+        uint64_t pullDoorbellReserved{0};
+        uint32_t pullRequestDrops{0};
     };
 
     DataRate DeriveRoceLineRate() const;
@@ -137,6 +142,7 @@ class UbDpu : public UbSwitch
     Time m_gradedCnpInterval{MicroSeconds(50)};
     bool m_pullMode{false};
     uint64_t m_pullWindowBytes{1024 * 1024};
+    uint32_t m_pullRequestQueueCap{4096};
     bool m_rpPushEnabled{false};
     bool m_rpPfcFeedbackEnabled{true};
     bool m_rpCqeFallbackEnabled{false};

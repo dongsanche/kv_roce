@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "ns3/ub-dpu.h"
+#include "ns3/ub-utils.h"
 
 #include "ns3/ub-datatype.h"
 #include "ns3/ub-datalink.h"
@@ -77,12 +78,19 @@ UbDpu::GetTypeId()
                           MakeBooleanAccessor(&UbDpu::m_pullMode),
                           MakeBooleanChecker())
             .AddAttribute("PullWindowBytes",
-                          "Pull mode: per-flow in-flight data window (bytes). Doorbells pause "
-                          "while arrived-minus-forwarded data exceeds this -- the 1825 pull "
-                          "speed that bounds the union buffer.",
+                          "Pull mode: per-flow in-flight window (bytes). Doorbells pause while "
+                          "arrived-minus-forwarded data PLUS the response bytes promised by "
+                          "already-doorbelled requests exceed this -- the 1825 pull speed that "
+                          "bounds the union buffer.",
                           UintegerValue(1024 * 1024),
                           MakeUintegerAccessor(&UbDpu::m_pullWindowBytes),
                           MakeUintegerChecker<uint64_t>())
+            .AddAttribute("PullRequestQueueCap",
+                          "Pull mode: max queued request packets per flow (1825 request queue "
+                          "capacity); excess requests are dropped and counted.",
+                          UintegerValue(4096),
+                          MakeUintegerAccessor(&UbDpu::m_pullRequestQueueCap),
+                          MakeUintegerChecker<uint32_t>())
             .AddAttribute("RpPushEnabled",
                           "When true, the RP actively pushes its per-flow rate back to each "
                           "source ASU on every allocation update.",
@@ -359,9 +367,12 @@ UbDpu::TryDoorbell(const DpuFlowKey& key)
         return;
     }
     // The request delivery IS the pull grant: doorbell the 1825 request queue to the ASU
-    // while the flow's in-flight data (arrived - forwarded) stays below the pull window.
-    // The window is the 1825 pull speed that bounds the union buffer.
-    while (!flow.pendingRequests.empty() && flow.pullOutstandingBytes < m_pullWindowBytes)
+    // while the flow's in-flight load (arrived-minus-forwarded data PLUS the response bytes
+    // already promised by doorbelled requests) stays below the pull window. The reservation
+    // is what prevents an emptied window from dumping the whole request backlog at once and
+    // flooding the union with a burst that bypasses the window.
+    while (!flow.pendingRequests.empty() &&
+           flow.pullOutstandingBytes + flow.pullDoorbellReserved < m_pullWindowBytes)
     {
         const PendingPacket& front = flow.pendingRequests.front();
         Ptr<UbPort> outDevice = DynamicCast<UbPort>(node->GetDevice(front.inPortId));
@@ -374,6 +385,9 @@ UbDpu::TryDoorbell(const DpuFlowKey& key)
             break; // UB egress full: hold the doorbell, retry on the next drain/arrival
         }
         outDevice->TriggerTransmit();
+        // One request segment yields one response segment (observed 2048 requests per 8MB
+        // read): reserve a full MTU per doorbell and settle it as the data actually arrives.
+        flow.pullDoorbellReserved += UB_MTU_BYTE;
         flow.pendingRequests.pop();
     }
 }
@@ -497,6 +511,10 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         if (m_pullMode)
         {
             flow.pullOutstandingBytes += packet->GetSize();
+            // Settle the doorbell reservation: the promised response bytes have arrived.
+            const uint64_t arrived = packet->GetSize();
+            flow.pullDoorbellReserved =
+                flow.pullDoorbellReserved > arrived ? flow.pullDoorbellReserved - arrived : 0;
         }
 
         // Start the periodic allocation loop on the first observed data packet, so rate control
@@ -597,6 +615,14 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
             const DpuFlowKey pullKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
             DpuFlowState& pullFlow = GetOrCreateFlowState(pullKey);
             // Record the UB egress port in the pending entry; TryDoorbell forwards there.
+            if (pullFlow.pendingRequests.size() >= m_pullRequestQueueCap)
+            {
+                // 1825 request queue full: the NPU's outstanding window exceeds this DPU's
+                // request buffering. Count it (a real device would NAK / withhold SQ credit).
+                ++pullFlow.pullRequestDrops;
+                utils::UbUtils::RecordRuntimePacketDrop("1825 request queue full");
+                return true;
+            }
             pullFlow.pendingRequests.push(PendingPacket{packet, outPort});
             TryDoorbell(pullKey);
             return true;
