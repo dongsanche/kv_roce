@@ -119,7 +119,6 @@ global UB_CC_DISABLED_NODES "{cc_disabled_nodes}"
 global UB_UNION_STATIC_INGRESS_MAP "{union_static_map}"
 # Per-WQE 1825 pull: token-gated WQE starts + unbound 1815e-side CBFC credit.
 global UB_PULL_MODE "{pull_mode}"
-default ns3::UbCtpTransportService::PullMode "{pull_mode}"
 default ns3::UbDpu::PullMode "{pull_mode}"
 # Union-only DCQCN thresholds: applied only to CBFC bus switches (the union on the UB side);
 # RoCE (PFC) switches keep the ns3::UbSwitchDcqcn defaults above.

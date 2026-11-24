@@ -65,11 +65,6 @@ struct CtpCongestionState
     uint64_t bytesSinceLastIncrease{0};
     EventId rateIncreaseEvent;
     EventId pacingWakeupEvent;
-    // Pull mode (per-WQE 1825 pull): unconsumed tokens and the WQE (request TA SSN) a token
-    // was already consumed for. Segments of that WQE pass free; a new WQE needs a token.
-    uint32_t pullTokens{0};
-    uint32_t pullGrantedTassn{0};
-    bool pullGrantedValid{false};
 };
 
 struct UbCtpRoutingPolicy
@@ -326,7 +321,6 @@ class UbCtpTransportService : public Object
     void OnSenderDataPacketSent(const UbCtpCongestionKey& key, uint32_t bytes);
     void OnCnpReceived(const UbCtpCongestionKey& key, uint8_t ecn);
     void OnExternalRate(const UbCtpCongestionKey& key, uint64_t rateBps);
-    void OnPullTokenReceived(const UbCtpCongestionKey& key);
     void SchedulePacingWakeup(const UbCtpCongestionKey& key);
     DataRate DeriveLineRate() const;
     uint64_t ClampBitRate(uint64_t bitRate) const;
@@ -357,7 +351,6 @@ class UbCtpTransportService : public Object
     std::map<UbCtpCongestionKey, uint32_t> m_congestionSignals;
     // CTP 拥塞控制状态：按 {目的 Entity, VL} 键值保存发送端速率状态。
     bool m_ccEnabled{false};
-    bool m_pullMode{false};
     DataRate m_lineRate{DataRate("400Gbps")};
     DataRate m_initialRate{DataRate("400Gbps")};
     DataRate m_rateAi{DataRate("40Mbps")};

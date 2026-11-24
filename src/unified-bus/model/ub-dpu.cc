@@ -68,21 +68,21 @@ UbDpu::GetTypeId()
                           MakeTimeAccessor(&UbDpu::m_gradedCnpInterval),
                           MakeTimeChecker())
             .AddAttribute("PullMode",
-                          "Per-WQE 1825 pull: the DPU grants CTP_PULL tokens to source ASUs "
-                          "(one WQE per token). A token is bootstrapped when the DPU first sees "
-                          "the flow (request direction) and re-issued once the granted WQE's "
-                          "data has fully crossed this DPU (burst followed by quiet time, "
-                          "pending drained) -- the 1825's pull speed is what bounds the union "
-                          "buffer. The ASU-side CBFC credit should be unbound in this mode.",
+                          "1825 doorbell pull: NPU READ/WRITE requests queue on this DPU (the "
+                          "1825 request queue) and are actively doorbell-delivered to the "
+                          "source ASU while the flow's in-flight data stays below "
+                          "PullWindowBytes. The request delivery is the grant; the ASU side "
+                          "carries no CBFC credit in this mode.",
                           BooleanValue(false),
                           MakeBooleanAccessor(&UbDpu::m_pullMode),
                           MakeBooleanChecker())
-            .AddAttribute("PullQuietTime",
-                          "Pull mode: no-arrival quiet window after which a data burst is "
-                          "considered a completed WQE (token re-issue point).",
-                          TimeValue(MicroSeconds(10)),
-                          MakeTimeAccessor(&UbDpu::m_pullQuietTime),
-                          MakeTimeChecker())
+            .AddAttribute("PullWindowBytes",
+                          "Pull mode: per-flow in-flight data window (bytes). Doorbells pause "
+                          "while arrived-minus-forwarded data exceeds this -- the 1825 pull "
+                          "speed that bounds the union buffer.",
+                          UintegerValue(1024 * 1024),
+                          MakeUintegerAccessor(&UbDpu::m_pullWindowBytes),
+                          MakeUintegerChecker<uint64_t>())
             .AddAttribute("RpPushEnabled",
                           "When true, the RP actively pushes its per-flow rate back to each "
                           "source ASU on every allocation update.",
@@ -342,105 +342,40 @@ UbDpu::SendCutCnp(const DpuFlowKey& key)
 }
 
 void
-UbDpu::SendPullToken(const DpuFlowKey& key, uint32_t ubPort)
+UbDpu::TryDoorbell(const DpuFlowKey& key)
 {
     if (!m_pullMode)
     {
         return;
     }
+    DpuFlowState& flow = GetOrCreateFlowState(key);
+    if (flow.pendingRequests.empty())
+    {
+        return;
+    }
     Ptr<Node> node = GetObject<Node>();
-    if (node == nullptr || ubPort >= node->GetNDevices() || !IsUbSide(ubPort))
+    if (node == nullptr)
     {
         return;
     }
-
-    // CTP_PULL token (per-WQE grant), sent from the DPU on behalf of the destination NPU
-    // (scna=NPU, dcna=ASU): the ASU may start one more response WQE on this {NPU, VL}.
-    // Unicast on the flow's arrival port: broadcasting on all UB ports would deliver one
-    // copy per union and double-grant (two WQEs per token).
-    Ptr<Packet> packet = Create<Packet>();
-
-    UbCompactEidHeader eidHeader;
-    eidHeader.SetSourceEid(1);
-    eidHeader.SetDestinationEid(1);
-    packet->AddHeader(eidHeader);
-
-    UbCompactUpiHeader upiHeader;
-    upiHeader.SetUpi(0);
-    packet->AddHeader(upiHeader);
-
-    UbCtpHeader ctpHeader;
-    ctpHeader.SetTPOpcode(CtpOpcode::CTP_PULL);
-    ctpHeader.SetNlp(UB_CTPH_NLP_UPI16_EID40_TAH);
-    packet->AddHeader(ctpHeader);
-
-    UbCna16NetworkHeader cnaHeader;
-    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(key.destinationNodeId)));
-    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(key.sourceNodeId)));
-    cnaHeader.SetServiceLevel(key.vl);
-    cnaHeader.SetNlp(UB_CNA_NLP_CTPH);
-    packet->AddHeader(cnaHeader);
-
-    UbDataLink::AddPacketHeader(packet,
-                                false,
-                                false,
-                                key.vl,
-                                key.vl,
-                                RoutingType::PER_FLOW_SHORTEST_PATHS,
-                                UbDatalinkHeaderConfig::PACKET_CNA16);
-
-    SendPacket(packet, ubPort, ubPort, key.vl);
-}
-
-void
-UbDpu::SchedulePullQuietCheck(const DpuFlowKey& key)
-{
-    DpuFlowState& flow = GetOrCreateFlowState(key);
-    if (flow.pullQuietEvent.IsPending())
+    // The request delivery IS the pull grant: doorbell the 1825 request queue to the ASU
+    // while the flow's in-flight data (arrived - forwarded) stays below the pull window.
+    // The window is the 1825 pull speed that bounds the union buffer.
+    while (!flow.pendingRequests.empty() && flow.pullOutstandingBytes < m_pullWindowBytes)
     {
-        return;
+        const PendingPacket& front = flow.pendingRequests.front();
+        Ptr<UbPort> outDevice = DynamicCast<UbPort>(node->GetDevice(front.inPortId));
+        if (outDevice == nullptr)
+        {
+            break;
+        }
+        if (!outDevice->EnqueueToEgress(std::make_tuple(front.inPortId, key.vl, front.packet)))
+        {
+            break; // UB egress full: hold the doorbell, retry on the next drain/arrival
+        }
+        outDevice->TriggerTransmit();
+        flow.pendingRequests.pop();
     }
-    const Time now = Simulator::Now();
-    const Time at = flow.pullLastArrival > now ? flow.pullLastArrival : now;
-    flow.pullQuietEvent =
-        Simulator::Schedule(at + m_pullQuietTime, &UbDpu::CheckPullQuiet, this, key);
-}
-
-void
-UbDpu::CheckPullQuiet(const DpuFlowKey& key)
-{
-    DpuFlowState& flow = GetOrCreateFlowState(key);
-    flow.pullQuietEvent = EventId();
-    const Time now = Simulator::Now();
-    if (now < flow.pullLastArrival + m_pullQuietTime)
-    {
-        // More data arrived meanwhile: not quiet yet, retry at the tail of the burst.
-        Simulator::Schedule(flow.pullLastArrival + m_pullQuietTime, &UbDpu::CheckPullQuiet, this,
-                            key);
-        return;
-    }
-    if (flow.pullOutstandingBytes > 0)
-    {
-        // Granted WQE data still parked here (PFC/egress backpressure): its pull is not done.
-        // The forwarding path re-schedules the quiet check when it drains.
-        return;
-    }
-    if (!flow.pullBootstrapped)
-    {
-        // First sighting of the flow: grant the first WQE.
-        flow.pullBootstrapped = true;
-        flow.pullBurstSeen = false;
-        SendPullToken(key, flow.pullLastUbPort);
-        return;
-    }
-    if (flow.pullBurstSeen)
-    {
-        // A data burst completed (the granted WQE fully crossed this DPU): grant the next.
-        flow.pullBurstSeen = false;
-        SendPullToken(key, flow.pullLastUbPort);
-    }
-    // No burst since the last grant: a token is already in the ASU's pocket (or the flow is
-    // idle) -- issuing another would grow the pocket and break the one-WQE-per-token rule.
 }
 
 void
@@ -562,10 +497,6 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         if (m_pullMode)
         {
             flow.pullOutstandingBytes += packet->GetSize();
-            flow.pullBurstSeen = true;
-            flow.pullLastArrival = Simulator::Now();
-            flow.pullLastUbPort = inPort;
-            SchedulePullQuietCheck(key);
         }
 
         // Start the periodic allocation loop on the first observed data packet, so rate control
@@ -614,23 +545,6 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
     // RoCE→UB 方向（request/CNP/CQE 等）：透传回 UB 侧，并顺带观测控制帧。
     if (IsPortCbfc(outPort))
     {
-        // Pull mode bootstrap: the first CTP packet toward an ASU (typically its READ request)
-        // proves the flow exists -- grant the first WQE token so the ASU's parked response WQE
-        // can start. Without this the ASU would wait forever (it only sends on tokens).
-        if (m_pullMode)
-        {
-            const DpuFlowKey pullKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
-            DpuFlowState& pullFlow = GetOrCreateFlowState(pullKey);
-            if (!pullFlow.pullBootstrapped)
-            {
-                pullFlow.pullBootstrapped = true;
-                if (pullFlow.pullLastUbPort == std::numeric_limits<uint32_t>::max())
-                {
-                    pullFlow.pullLastUbPort = outPort;
-                }
-                SendPullToken(pullKey, pullFlow.pullLastUbPort);
-            }
-        }
         // Scheme 3 (graded) ONLY, gated on GradedBackpressure + TRANSPARENT (schemes 1/2 untouched):
         // translate the RoCE-domain CNP into a per-VL UB-side CNP and re-emit it to the ASU
         // (CTP CC is per-VL), consuming the original.
@@ -673,6 +587,19 @@ UbDpu::DirectForwardCtpDataPacket(Ptr<Packet> packet,
         if (outDevice == nullptr)
         {
             return false;
+        }
+        // 1825 request queue + active doorbell (pull mode): NPU READ/WRITE requests
+        // (CTP_DATA) queue on this DPU and are doorbell-delivered to the ASU under the
+        // pull-window gate; CNP/CQE/PULL control packets pass through immediately
+        // (latency-critical). The request delivery itself is the pull grant.
+        if (m_pullMode && headers.ctpHeader.GetTPOpcode() == static_cast<uint8_t>(CtpOpcode::CTP_DATA))
+        {
+            const DpuFlowKey pullKey{Cna16ToNodeId(dcna), Cna16ToNodeId(scna), vl};
+            DpuFlowState& pullFlow = GetOrCreateFlowState(pullKey);
+            // Record the UB egress port in the pending entry; TryDoorbell forwards there.
+            pullFlow.pendingRequests.push(PendingPacket{packet, outPort});
+            TryDoorbell(pullKey);
+            return true;
         }
         outDevice->EnqueueToEgress(std::make_tuple(inPort, priority, packet));
         outDevice->TriggerTransmit();
@@ -740,7 +667,6 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
         if (m_pullMode)
         {
             flow.pullOutstandingBytes -= front.packet->GetSize();
-            SchedulePullQuietCheck(key);
         }
         flow.pendingControl.pop();
         sent = true;
@@ -771,15 +697,12 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
             inDevice->GetFlowControl()->OnIngressReleased(ctx);
         }
 
-        // Pull mode: the granted WQE's data progressed through the DPU toward the RoCE wire.
-        // Once the flow fully drains (outstanding == 0) and goes quiet, CheckPullQuiet issues
-        // the next token -- the pull-speed bound.
+        // Pull mode: the flow's in-flight data drained toward the RoCE wire; the pull window
+        // re-opens (doorbell re-fires after this loop).
         if (m_pullMode)
         {
             flow.pullOutstandingBytes -= front.packet->GetSize();
-            SchedulePullQuietCheck(key);
         }
-
         const double seconds =
             static_cast<double>(front.packet->GetSize()) * 8.0 / static_cast<double>(rateBps);
         flow.nextSendTime = Simulator::Now() + Seconds(seconds);
@@ -790,6 +713,11 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
     {
         outDevice->TriggerTransmit();
     }
+    if (m_pullMode)
+    {
+        // Data left the flow: the pull window opened, doorbell queued requests again.
+        TryDoorbell(key);
+    }
 }
 
 void
@@ -798,6 +726,7 @@ UbDpu::RetryHeldFlows()
     for (auto& entry : m_flowStates)
     {
         TrySendQp(entry.first);
+        TryDoorbell(entry.first);
     }
     m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
 }

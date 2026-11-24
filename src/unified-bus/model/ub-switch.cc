@@ -1010,7 +1010,13 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "Unified-bus reserves priority 0 for locally generated control frames in the "
                     "simulator model. Data packets must use priority 1..15.");
 
-    if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+    // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
+    // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
+    static const bool skipIngressAdmission = []() {
+        BooleanValue enabled;
+        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+    }();
+    if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");
@@ -1045,7 +1051,13 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
                     "Unified-bus reserves priority 0 for locally generated control frames in the "
                     "simulator model. Data packets must use priority 1..15.");
 
-    if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+    // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
+    // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
+    static const bool skipIngressAdmission = []() {
+        BooleanValue enabled;
+        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+    }();
+    if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");
@@ -1081,7 +1093,13 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
         return;
     }
 
-    if (!m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
+    // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
+    // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
+    static const bool skipIngressAdmission = []() {
+        BooleanValue enabled;
+        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+    }();
+    if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
         NS_LOG_WARN("NodeId " << GetObject<Node>()->GetId() << " InPort " << inPort << " pri=" << (uint32_t)priority
                     << " buffer full. Packet Dropped!");

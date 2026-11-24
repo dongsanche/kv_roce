@@ -772,3 +772,41 @@ pull 关闭时零行为变化（8/8 任务回归通过）。
 
 参数与语义备注：union 出口 VOQ 仍由 union→1825 credit（转发成功才还）约束 = pull 速度的
 包级实现；union 打标/per-NL 语义不变（§19 全部结论在 pull 架构下位置不变）。
+
+
+### 19.14 架构修正（用户确认）：union/1825 的精确职责 → pull 改为 doorbell
+
+修正后的真实模型（覆盖 19.13 的 token 设计）：
+
+- **union 只做两件事**：per-NL ECN 打标 + VL 调度（SP/DWRR）。即 VOQ buffer + 标记 +
+  仲裁，**没有** ingress 准入门/丢包，也不是 CBFC credit 的终结者。
+- **1825 只做两件事**：RoCE↔UB 转换；**请求队列 + 主动 doorbell**——NPU 的读写请求在
+  1825 排队，1825 按自己的节奏（pull 速度）把请求发给 1815e。
+- **1815e 无 credit**：收到 doorbell 请求才生成响应→响应生成被请求投递自然节流。
+
+推导：**请求的投递本身就是授权**。19.13 实现的 CTP_PULL token / ASU 侧 WQE 门是多余
+抽象，应删除；改为 1825 侧请求队列 + doorbell 节流（门：该流在途数据 outstanding <
+PullWindowBytes，即 pull 速度对 union 的上限保护；数据排空后继续放行请求）。请求与
+应答（CNP/CQE）分流：CTP_DATA（RoCE→UB）进请求队列；CTP_CNP/CTP_CQE 直通（延迟敏感）。
+
+
+### 19.15 doorbell 重构验证（pull 模式跑通）
+
+按 19.14 重构后（删除 CTP_PULL token/ASU 门；1825 请求队列 + doorbell；union 去掉准入
+丢包；请求/控制分流：CTP_DATA 入请求队列，CNP/CQE 直通），实测：
+
+| 用例 | 结果 |
+|---|---|
+| pull + no-cc | **8/8 任务完成**，0 丢包，per-task 1.2-2.8ms（≈ 线速制约，与 pull-off 基线同量级） |
+| pull + 打标开 + CTP CC 关 | 8/8 完成，0 丢包，同性能；union per-NL 打标正常触发（vl1=3435、vl7=3745），
+  对称 incast 下 sibling-driven false=0（与 §19 结论一致：都"有罪"时无连坐表象） |
+| pull-off 回归 | 与改动前一致（8/8） |
+
+之前 19.13 的两个阻塞定位结论：token/ASU 门方案的死锁根因是**请求-应答反馈环被 token
+机制干扰**（请求泵在 ~512 段停摆）；改成"请求投递即授权"的 doorbell 后自然消失。
+pull+CC 开（CNP 风暴 pacing 债务冻结）仍为 CC 侧老病（19.13 第 1 条），与 doorbell 架构
+正交，待 CC 恢复机制修复后复测。
+
+架构现状（与用户确认真实硬件一致）：union = VOQ buffer + per-NL ECN 打标 + SP/DWRR；
+1825 = RoCE↔UB 转换 + 请求队列/主动 doorbell（PullWindowBytes=1MB 默认，门 = 在途数据
+< 窗口）；1815e = 无 CBFC credit，按 doorbell 请求生成响应。
