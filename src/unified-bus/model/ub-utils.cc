@@ -4124,11 +4124,17 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             Ptr<UbPort> port = CreateObject<UbPort>();
             port->SetAddress(Mac48Address::Allocate());
             node->AddDevice(port);
-            // Pull mode: the 1815e endpoint carries no CBFC credit in the real architecture --
-            // unbound its transmit credit so the per-WQE pull tokens are the binding flow
-            // control. (Switch/DPU ports keep their normal credit; the union->1825 return
-            // stays forward-success-only as the 1825's pull speed.)
-            if (nodeConfig.nodeType == "DEVICE")
+            // Pull/KV-push modes: neither the 1815e nor the union is a credit-granting
+            // flow-control endpoint in the real architecture. Unbind transmit credit on
+            // (a) DEVICE ports -- the 1815e carries no credit (the 1825's pull window binds),
+            // and (b) the DPU's UB-side ports -- the union must never throttle the 1825's
+            // doorbell/credit control traffic (it is naturally bounded: credits per forwarded
+            // byte, requests per WQE). The union->1825 data credit stays: it is the 1825's
+            // receive window (spec 4.6: credits are always receiver-granted), and it is what
+            // parks the standing backlog inside the union VOQ for per-NL ECN marking.
+            if (nodeConfig.nodeType == "DEVICE" ||
+                (nodeConfig.nodeType == "DPU" &&
+                 portId < nodeConfig.portCount - nodeConfig.rocePortCount))
             {
                 BooleanValue pullMode;
                 BooleanValue kvPushMode;

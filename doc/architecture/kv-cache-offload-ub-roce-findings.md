@@ -922,3 +922,26 @@ union 准入跳过。保留 union→1825 链的 credit（**方向澄清**：那�
 （NPU9 2422/2399µs，NPU10 696/717µs），打标照常触发且 **A 臂连坐依旧**（u4 vl7:
 4 marks 全部 sibling-driven；u5 vl6 7177 own-driven）。结论：union 纯化后 §19.18 的
 四象限结论不变——连坐机制存在（同 NL）、无害（无 CC 消费环）、隔离 NL 即消除。
+
+
+### 19.20 union 信用彻底退场（含反向）
+
+用户最终定案：**union 不应该有 credit——任何方向都不做信用终结点**。19.19 只解绑了
+ASU 侧；反方向上 union 仍作为接收方向 1825 的 UB 口授予发送信用（doorbell/KV_CREDIT/
+cut-CNP 的通道）。修复：KV/pull 模式下 **DPU 的 UB 侧端口发送信用也解绑**（RoCE 侧
+PFC 口不受影响）。反向流量天然有界（KV_CREDIT 按转发字节生成、请求按 WQE 生成、
+CNP 按 50µs 节流），无溢出风险——实测两臂复跑 8/8 全量完成、0 丢包，victim 稳定在
+~720µs（多次重跑确认 2587µs 是单次波动非系统性副作用）。
+
+最终信用拓扑（KV-push 模式）：
+
+| 链路/方向 | 信用 | 说明 |
+|---|---|---|
+| ASU→union（数据） | **无** | 1815e 无 credit，doorbell 节拍即流控 |
+| union→1825（数据） | 1825 授（接收窗口） | 唯一保留：1825 的接收能力，积压停靠在 union VOQ 供打标 |
+| 1825→union（控制） | **无**（本次解绑） | union 不再作为接收方节流 1825 |
+| union→ASU（控制） | ASU 授（接收语义） | union 被动 |
+| RoCE 侧 | PFC per-VL | 不变 |
+
+union 最终职责（与用户定义一致）：**buffer + per-NL ECN 打标 + SP/DWRR VL 调度**，
+无任何信用授受的决策角色。
