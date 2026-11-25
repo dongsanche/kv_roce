@@ -4131,8 +4131,13 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
             if (nodeConfig.nodeType == "DEVICE")
             {
                 BooleanValue pullMode;
-                if (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
-                    pullMode.Get())
+                BooleanValue kvPushMode;
+                const bool unbindCredit =
+                    (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                     pullMode.Get()) ||
+                    (GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", kvPushMode) &&
+                     kvPushMode.Get());
+                if (unbindCredit)
                 {
                     port->SetAttributeFailSafe(
                         "CbfcInitCreditCell",

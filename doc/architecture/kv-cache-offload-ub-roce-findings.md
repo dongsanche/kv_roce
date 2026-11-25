@@ -904,3 +904,21 @@ union 阈值（Kmin 5120），`--kv-proto push`。修好两个阻塞后两臂均
 不构成性能风险（当前形态）；若未来要给 KV 流加 CC（如背压式或显式速率），A 臂的
 84% 误打率就是届时会被放大的隐患——per-VL own-backlog 归因打标（§19.9）仍是
 正确的预防性修法。
+
+
+### 19.19 union 职责收口：KV 模式下 ASU 侧 credit 解绑 + 准入移除
+
+用户纠偏：union 只做 ECN 打标 + VL 调度。19.18 的跑法里 `UB_PULL_MODE=false`，导致两个
+违规层仍然活跃：① ASU→union 链的 CBFC credit 是 **union 授给 1815e 的**（1MB/VL——
+违反"1815e 无 credit"）；② union ingress 准入门。
+
+修复：`UB_KV_PUSH_MODE` 触发与 pull 模式相同的两项——DEVICE 端口 credit 解绑、
+union 准入跳过。保留 union→1825 链的 credit（**方向澄清**：那是 **1825 授给 union 的
+接收窗口**，规范 §4.6 credit 永远是接收方授的，union 在该链被动被节流、不违反"只做
+两件事"）；正是这层让积压停在 union VOQ（924KB 级），ECN 打标才有意义——若也移除，
+积压将全部转移到 1825 pending，union 打标退化为死代码。
+
+复跑 A/B 两臂（union 无 credit/无准入）：均 8/8 全量完成、0 丢包、性能持平
+（NPU9 2422/2399µs，NPU10 696/717µs），打标照常触发且 **A 臂连坐依旧**（u4 vl7:
+4 marks 全部 sibling-driven；u5 vl6 7177 own-driven）。结论：union 纯化后 §19.18 的
+四象限结论不变——连坐机制存在（同 NL）、无害（无 CC 消费环）、隔离 NL 即消除。

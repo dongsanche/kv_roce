@@ -1097,8 +1097,12 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
     // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
     static const bool skipIngressAdmission = []() {
-        BooleanValue enabled;
-        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+        BooleanValue pullMode;
+        BooleanValue kvPushMode;
+        return (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                pullMode.Get()) ||
+               (GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", kvPushMode) &&
+                kvPushMode.Get());
     }();
     if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
@@ -1138,8 +1142,12 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
     // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
     static const bool skipIngressAdmission = []() {
-        BooleanValue enabled;
-        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+        BooleanValue pullMode;
+        BooleanValue kvPushMode;
+        return (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                pullMode.Get()) ||
+               (GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", kvPushMode) &&
+                kvPushMode.Get());
     }();
     if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
@@ -1180,8 +1188,12 @@ void UbSwitch::ForwardDataPacket(Ptr<UbPort> port, Ptr<Packet> packet, const Par
     // Pull mode: the union only buffers, marks (per-NL ECN) and schedules (SP/DWRR) -- there
     // is no ingress admission gate; the 1825 doorbell window bounds the in-flight bytes.
     static const bool skipIngressAdmission = []() {
-        BooleanValue enabled;
-        return GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", enabled) && enabled.Get();
+        BooleanValue pullMode;
+        BooleanValue kvPushMode;
+        return (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                pullMode.Get()) ||
+               (GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", kvPushMode) &&
+                kvPushMode.Get());
     }();
     if (!skipIngressAdmission && !m_queueManager->CheckInPortSpace(inPort, priority, pSize)) {
         utils::UbUtils::RecordRuntimePacketDrop("ingress buffer full");
