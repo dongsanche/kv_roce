@@ -4166,15 +4166,34 @@ UbUtils::CreateNode(const std::vector<UbStructuredNodeConfig>& nodes)
         {
             sw->SetAttribute("FlowControl", StringValue(nodeConfig.flowControl));
         }
+        // KV/pull modes: the union is buffer + per-NL ECN marking + SP/DWRR only -- it is
+        // never a credit endpoint in ANY direction. Strip its flow-control machinery: the
+        // ASU-side ports neither grant (already unbounded) nor return credit, and the
+        // gateway-side ports' transmit credit is unbounded (the 1825's data-window credit
+        // accounting at the DPU bounds in-flight bytes instead).
+        if (nodeConfig.nodeType == "SWITCH")
+        {
+            BooleanValue pullMode;
+            BooleanValue kvPushMode;
+            const bool noFc =
+                (GlobalValue::GetValueByNameFailSafe("UB_PULL_MODE", pullMode) &&
+                 pullMode.Get()) ||
+                (GlobalValue::GetValueByNameFailSafe("UB_KV_PUSH_MODE", kvPushMode) &&
+                 kvPushMode.Get());
+            if (noFc)
+            {
+                sw->SetAttribute("FlowControl", StringValue("NONE"));
+            }
+        }
         sw->Init();
         auto cc = UbCongestionControl::Create(UB_SWITCH);
         cc->OnSwitchAttached(sw);
-        // Union-only DCQCN NL grouping: a CBFC "bus" switch (the union on the UB side) marks ECN
-        // per NL of 2 VLs, so the two VLs in an NL share the congestion/marking decision. RoCE
-        // switches (PFC) and the DPU are left at the default per-port / VL aggregated marking.
-        if (nodeConfig.nodeType == "SWITCH" &&
-            (sw->GetFlowControlTypeForPort(0) == FcType::CBFC ||
-             sw->GetFlowControlTypeForPort(0) == FcType::CBFC_SHARED))
+        // Union-only DCQCN NL grouping: the union marks ECN per NL of 2 VLs, so the two VLs
+        // in an NL share the congestion/marking decision. Identified by nodeType == SWITCH
+        // (gateway DPUs and the RoCE switch are DPU nodes); independent of the union's flow
+        // control, which is NONE in KV/pull modes (the union is buffer+mark+schedule only).
+        // RoCE switches (PFC) and the DPU keep the default per-port / VL aggregated marking.
+        if (nodeConfig.nodeType == "SWITCH")
         {
             cc->SetAttributeFailSafe("VlPerNl", UintegerValue(2));
             // Union-only DCQCN thresholds (UB_UNION_DCQCN_*): lets experiments sensitize union
