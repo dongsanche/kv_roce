@@ -4,6 +4,7 @@
 
 #include <ns3/core-module.h>
 #include <vector>
+#include <deque>
 #include <map>
 #include <unordered_map>
 #include "ub-datatype.h"
@@ -55,8 +56,10 @@ public:
     };
     void StartKvPush(uint32_t taskId);
     void PumpKvPush(uint32_t taskId);
+    void PumpKvFlow(uint32_t dstNode, uint8_t vl);
     Ptr<UbPort> FirstKvUbPort() const;
     std::map<uint32_t, KvPushTask> m_kvPushTasks;
+    std::map<std::pair<uint32_t, uint32_t>, std::deque<uint32_t>> m_kvFlowOrder;
     std::map<std::pair<uint32_t, uint32_t>, int64_t> m_kvPushCredits;
 
     static TypeId GetTypeId();

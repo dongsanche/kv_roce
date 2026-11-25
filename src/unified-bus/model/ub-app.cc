@@ -858,7 +858,10 @@ UbApp::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t inPort)
     }
     case KvOpcode::KV_DONE:
     {
-        if (m_kvCompleted.insert(taskId).second)
+        // An early DONE (its data tail can still be in flight somewhere in the fabric)
+        // must NOT complete the task: the byte-counting DATA path is authoritative.
+        if (m_kvRxBytes[taskId] >= m_kvRxExpected[taskId] &&
+            m_kvCompleted.insert(taskId).second)
         {
             UbTrafficGen::Get()->OnTaskCompleted(taskId);
         }

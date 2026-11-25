@@ -838,6 +838,7 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
         push.offset = 0;
         push.ubPort = inPort;
         m_kvPushTasks[taskId] = push;
+        m_kvFlowOrder[{sourceNodeId, kv.GetVl()}].push_back(taskId);
         Ptr<UbSsd> ssd = GetUbSsd();
         if (ssd != nullptr)
         {
@@ -854,19 +855,8 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
     }
     case KvOpcode::KV_CREDIT:
     {
-                m_kvPushCredits[{sourceNodeId, kv.GetVl()}] += static_cast<int64_t>(kv.GetKvAddr());
-        std::vector<uint32_t> pending;
-        for (const auto& [id, push] : m_kvPushTasks)
-        {
-            if (push.dstNode == sourceNodeId && push.vl == kv.GetVl())
-            {
-                pending.push_back(id);
-            }
-        }
-        for (const uint32_t id : pending)
-        {
-            PumpKvPush(id);
-        }
+        m_kvPushCredits[{sourceNodeId, kv.GetVl()}] += static_cast<int64_t>(kv.GetKvAddr());
+        PumpKvFlow(sourceNodeId, kv.GetVl());
         break;
     }
     default:
@@ -877,7 +867,35 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
 void
 UbController::StartKvPush(uint32_t taskId)
 {
-    PumpKvPush(taskId);
+    const auto it = m_kvPushTasks.find(taskId);
+    if (it == m_kvPushTasks.end())
+    {
+        return;
+    }
+    PumpKvFlow(it->second.dstNode, it->second.vl);
+}
+
+void
+UbController::PumpKvFlow(uint32_t dstNode, uint8_t vl)
+{
+    // One WQE per flow, matching the 1825's doorbell serialization: only the head task of
+    // the flow pumps. A completed head retires from the order queue so the next may start.
+    auto& order = m_kvFlowOrder[{dstNode, vl}];
+    while (!order.empty())
+    {
+        const uint32_t head = order.front();
+        if (m_kvPushTasks.find(head) == m_kvPushTasks.end())
+        {
+            order.pop_front(); // retired already (SSD callback may fire out of order)
+            continue;
+        }
+        PumpKvPush(head);
+        if (m_kvPushTasks.find(head) != m_kvPushTasks.end())
+        {
+            return; // head still has work: it holds the flow until its DONE
+        }
+        order.pop_front();
+    }
 }
 
 void
