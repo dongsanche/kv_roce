@@ -119,9 +119,6 @@ class UbDpu : public UbSwitch
         // below PullWindowBytes -- the 1825's pull speed, which bounds the union buffer.
         std::queue<PendingPacket> pendingRequests;
         uint64_t pullOutstandingBytes{0};
-        // KV-push protocol state: one active push (WQE) per flow; per-forward credit return.
-        bool kvPushActive{false};
-        uint64_t kvCreditAccum{0};
         // Response bytes already promised by doorbelled requests whose data has not arrived
         // yet. Without it, an emptied window dumps the whole request backlog in one burst and
         // the 4KB-per-request response flood bypasses the pull window.
@@ -135,9 +132,28 @@ class UbDpu : public UbSwitch
     void PushRateToAsu(const DpuFlowKey& key, DataRate rate, CtpOpcode opcode = CtpOpcode::CTP_CNP);
     void SendCutCnp(const DpuFlowKey& key);
     void TryDoorbell(const DpuFlowKey& key);
+    /**
+     * @brief Per-VL state of the KV-push protocol on the 1825 (the user-defined model).
+     *
+     * requests: the 1825's per-VL request queue (NPU read/write requests, FIFO).
+     * pending : the per-VL receive buffer -- doorbelled data that has arrived but not yet
+     *           reached the RoCE wire.
+     * reserved: bytes of doorbelled-but-not-yet-forwarded WQEs. A request is doorbelled only
+     *           when the receive buffer can absorb the WHOLE WQE (doorbell == permission to
+     *           push the entire request; there is no mid-WQE pacing), so `reserved` is the
+     *           only backlog bound and it never exceeds the buffer.
+     */
+    struct KvVlState
+    {
+        std::queue<PendingPacket> requests; // {packet, UB egress port toward the ASU}
+        std::queue<PendingPacket> pending;  // {packet, RoCE egress port toward the NPU}
+        uint64_t reservedBytes{0};
+    };
+    std::map<uint8_t, KvVlState> m_kvVl;
+
     bool DirectForwardKvFrame(Ptr<Packet> packet, uint32_t inPort, uint32_t outPort) override;
-    void TryKvDoorbell(const DpuFlowKey& key);
-    void SendKvCredit(const DpuFlowKey& key, uint64_t bytes, uint32_t ubPort);
+    void TryKvDoorbell(uint8_t vl);
+    void TrySendKv(uint8_t vl);
     bool IsRoceVlPaused(uint32_t portId, uint8_t vl) const;
     void TrySendQp(const DpuFlowKey& key);
     void RetryHeldFlows();
@@ -148,6 +164,7 @@ class UbDpu : public UbSwitch
     Time m_gradedCnpInterval{MicroSeconds(50)};
     bool m_pullMode{false};
     uint64_t m_pullWindowBytes{1024 * 1024};
+    uint64_t m_kvRxBuffersBytes{16 * 1024 * 1024};
     uint32_t m_pullRequestQueueCap{4096};
     bool m_rpPushEnabled{false};
     bool m_rpPfcFeedbackEnabled{true};

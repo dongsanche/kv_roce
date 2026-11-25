@@ -838,7 +838,6 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
         push.offset = 0;
         push.ubPort = inPort;
         m_kvPushTasks[taskId] = push;
-        m_kvFlowOrder[{sourceNodeId, kv.GetVl()}].push_back(taskId);
         Ptr<UbSsd> ssd = GetUbSsd();
         if (ssd != nullptr)
         {
@@ -854,11 +853,7 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
         break;
     }
     case KvOpcode::KV_CREDIT:
-    {
-        m_kvPushCredits[{sourceNodeId, kv.GetVl()}] += static_cast<int64_t>(kv.GetKvAddr());
-        PumpKvFlow(sourceNodeId, kv.GetVl());
-        break;
-    }
+        break; // not produced any more: a doorbell authorises the whole WQE
     default:
         break;
     }
@@ -867,35 +862,10 @@ UbController::HandleKvFrame(Ptr<Packet> frame, uint32_t sourceNodeId, uint32_t i
 void
 UbController::StartKvPush(uint32_t taskId)
 {
-    const auto it = m_kvPushTasks.find(taskId);
-    if (it == m_kvPushTasks.end())
-    {
-        return;
-    }
-    PumpKvFlow(it->second.dstNode, it->second.vl);
-}
-
-void
-UbController::PumpKvFlow(uint32_t dstNode, uint8_t vl)
-{
-    // One WQE per flow, matching the 1825's doorbell serialization: only the head task of
-    // the flow pumps. A completed head retires from the order queue so the next may start.
-    auto& order = m_kvFlowOrder[{dstNode, vl}];
-    while (!order.empty())
-    {
-        const uint32_t head = order.front();
-        if (m_kvPushTasks.find(head) == m_kvPushTasks.end())
-        {
-            order.pop_front(); // retired already (SSD callback may fire out of order)
-            continue;
-        }
-        PumpKvPush(head);
-        if (m_kvPushTasks.find(head) != m_kvPushTasks.end())
-        {
-            return; // head still has work: it holds the flow until its DONE
-        }
-        order.pop_front();
-    }
+    // The 1825 doorbelled this request only after reserving room for the WHOLE WQE in its
+    // per-VL receive buffer, so the 1815e simply pushes the entire response at line rate --
+    // there is no mid-WQE pacing and no per-flow push state on the ASU.
+    PumpKvPush(taskId);
 }
 
 void
@@ -925,14 +895,9 @@ UbController::PumpKvPush(uint32_t taskId)
     {
         return;
     }
-    int64_t& credit = m_kvPushCredits[{push.dstNode, push.vl}];
     while (push.remaining > 0)
     {
         const uint32_t frameBytes = static_cast<uint32_t>(std::min<uint64_t>(push.remaining, 4096));
-        if (credit < static_cast<int64_t>(frameBytes))
-        {
-            return; // wait for the next KV_CREDIT
-        }
         UbKvHeader kv;
         kv.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_DATA));
         kv.SetVl(push.vl);
@@ -960,8 +925,7 @@ UbController::PumpKvPush(uint32_t taskId)
             Simulator::Schedule(MicroSeconds(1), &UbController::PumpKvPush, this, taskId);
             return;
         }
-                credit -= static_cast<int64_t>(frameBytes);
-        push.offset += frameBytes;
+                push.offset += frameBytes;
         push.remaining -= frameBytes;
     }
     UbKvHeader done;

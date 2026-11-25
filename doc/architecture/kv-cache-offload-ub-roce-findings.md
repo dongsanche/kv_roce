@@ -1048,3 +1048,37 @@ credit 退场终态（19.21-19.22）下的基准与压测（均 0 丢包）：
 RoCE PFC 状态），但 1825 不向外发任何显式拥塞信号——ASU 只能"不知道为什么地停在窗口"。
 若未来需要自适应行为（区分暂态窗口摊销 vs 下游拥塞），应在 1825 的 KV_CREDIT 上加
 拥塞标志位（或独立信号帧），让源头能感知并主动让速。这是下一层网关模型的自然演进点。
+
+
+### 19.25 1825 模型按用户定案重构：per-VL 请求队列 + doorbell=整个 WQE + 有界接收缓冲
+
+用户定案（取代 19.17 以来的 per-flow 信用窗模型——那是从方案1 的 DpuFlowKey 继承的
+实现选择，非硬件事实）：
+- **请求队列 per-VL**（NPU 的读写请求在 1825 上按 VL 排队）
+- **doorbell 一个请求 = 允许 1815e 推完整个请求**（WQE 级，无中间节拍）
+- 1825 接收缓冲必须 ≥ 能吃下整个 WQE，否则溢出
+
+重构实现：
+- `KvVlState`（per-VL）：`requests`（请求队列）、`pending`（接收缓冲：已到未发 RoCE）、
+  `reservedBytes`（已 doorbell 未转发完的 WQE 字节）
+- `TryKvDoorbell(vl)`：**准入门控**——只有 `reserved + WQE.length <= KvRxBuffersBytes`
+  才放行 doorbell，放行即预留整个 WQE 长度；并发 WQE 数 = 缓冲 / WQE 大小
+- `TrySendKv(vl)`：per-VL FIFO 转发到 RoCE 出口，转发成功释放预留 → 再尝试 doorbell
+- **KV_CREDIT 信用窗整体删除**：1815e 收到请求后直接线速推完整个 WQE，无 per-flow
+  推送状态；doorbell 准入是唯一的积压控制点
+- `KvRxBuffersBytes` 属性（默认 16MB/VL）
+
+回归：单 NPU / 四象限两臂 / 验证 case 全部全量完成、0 丢包。
+
+**三问在新模型下的判定（证据）**：
+
+| 问题 | 判定 | 证据 |
+|---|---|---|
+| 1. RoCE 拥塞传不到 UBC | **结构性解决**：RoCE 停 → 预留不释放 → 不再 doorbell → 请求在 per-VL 队列等；1825 永不要求 union 运送自己装不下的量。仍无显式信号（源头只是收不到 doorbell） | 1825 RoCE 出口峰值仅 4–60KB |
+| 2. UBC 堵住会错误打标 | **不成立**：union 从不积压（预留保证 1825 总能收）→ 0 marks | node4/5 无 mark 文件 |
+| 3. VL 级控制产生受害流 | **真实重现，但来源不是请求队列**：同 VL / 同 NL / 隔离三类受害流 E2E **完全相同**（p50 均 237µs，原信用窗模型 9µs），因为 HOL 发生在 **node8→NPU 的共享出口队列**（单口 200G 跨 VL FIFO），被整个 WQE 的 8MB 突发填满（VOQ 峰值 5.4MB），任何 VL 的小流都排在后面 | node8 p4 VOQ 峰值 5.4MB；受害 64KB 排 237µs |
+
+**结论**：doorbell=整 WQE 模型下，1825 自身的积压被预留门控精确约束（问题 1/2 消失），
+但代价是把突发整个推到 RoCE 侧——受害流问题从 1825 转移到了 RoCE 交换机的共享
+出口，且与 VL 编排无关（跨 VL）。缓解只能在 RoCE 侧：出口 per-VL 调度（SP 让控制/小
+流量 VL 优先）或限制 WQE 突发（回到某种节拍，与定案 1 冲突）。

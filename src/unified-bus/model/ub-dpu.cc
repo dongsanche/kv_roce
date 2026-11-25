@@ -77,6 +77,13 @@ UbDpu::GetTypeId()
                           BooleanValue(false),
                           MakeBooleanAccessor(&UbDpu::m_pullMode),
                           MakeBooleanChecker())
+            .AddAttribute("KvRxBuffersBytes",
+                          "KV-push: per-VL receive buffer on the 1825 (bytes). A request is "
+                          "doorbelled only when the buffer can absorb the whole WQE, so this "
+                          "bounds the backlog and the WQE concurrency per VL.",
+                          UintegerValue(16 * 1024 * 1024),
+                          MakeUintegerAccessor(&UbDpu::m_kvRxBuffersBytes),
+                          MakeUintegerChecker<uint64_t>())
             .AddAttribute("PullWindowBytes",
                           "Pull mode: per-flow in-flight window (bytes). Doorbells pause while "
                           "arrived-minus-forwarded data PLUS the response bytes promised by "
@@ -742,16 +749,6 @@ UbDpu::TrySendQp(const DpuFlowKey& key)
                                             ? flow.pullOutstandingBytes - front.packet->GetSize()
                                             : 0;
         }
-        if (flow.kvPushActive)
-        {
-            // KV push: return consumed bytes to the ASU in batches (>=64KB) so it can push more.
-            flow.kvCreditAccum += front.packet->GetSize();
-            if (flow.kvCreditAccum >= 64 * 1024)
-            {
-                SendKvCredit(key, flow.kvCreditAccum, front.inPortId);
-                flow.kvCreditAccum = 0;
-            }
-        }
         const double seconds =
             static_cast<double>(front.packet->GetSize()) * 8.0 / static_cast<double>(rateBps);
         flow.nextSendTime = Simulator::Now() + Seconds(seconds);
@@ -798,53 +795,36 @@ UbDpu::DirectForwardKvFrame(Ptr<Packet> packet, uint32_t inPort, uint32_t outPor
 
     if (IsRoceSide(inPort))
     {
-        // NPU -> ASU request: the flow key is {ASU, NPU, vl} (ASU = destination CNA).
-        const DpuFlowKey key{dcna, scna, vl};
-        DpuFlowState& flow = GetOrCreateFlowState(key);
-        // NPU -> ASU: the READ request enters the 1825 request queue and is doorbelled
-        // (one active push per flow; the push credits pace the data, not the request).
+        // NPU -> ASU request: enters the 1825's PER-VL request queue; doorbelled when the
+        // per-VL receive buffer can absorb the whole WQE (see TryKvDoorbell).
         if (kvHeader.GetOpcode() != static_cast<uint8_t>(KvOpcode::KV_READ_REQ))
         {
             return false;
         }
-        if (flow.pendingRequests.size() >= m_pullRequestQueueCap)
+        KvVlState& st = m_kvVl[vl];
+        if (st.requests.size() >= m_pullRequestQueueCap)
         {
-            ++flow.pullRequestDrops;
             utils::UbUtils::RecordRuntimePacketDrop("1825 KV request queue full");
             return true;
         }
-        flow.pendingRequests.push(PendingPacket{packet, outPort});
-        TryKvDoorbell(key);
+        st.requests.push(PendingPacket{packet, outPort});
+        TryKvDoorbell(vl);
         return true;
     }
     if (IsPortCbfc(inPort))
     {
-        // ASU -> NPU: the flow key is again {ASU, NPU, vl} (ASU = source CNA here).
-        const DpuFlowKey key{scna, dcna, vl};
-        DpuFlowState& flow = GetOrCreateFlowState(key);
-        // Push data (forward via the per-flow QP) or the WQE-done marker.
-        if (kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DATA))
+        // ASU -> NPU: push data / the WQE-done marker land in the per-VL receive buffer and
+        // are forwarded to the RoCE egress as it drains (per-VL FIFO: same-VL flows share it).
+        if (kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DATA) ||
+            kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DONE))
         {
-            flow.roceOutPort = outPort;
-            flow.pending.push(PendingPacket{packet, inPort});
-            TrySendQp(key);
+            KvVlState& st = m_kvVl[vl];
+            st.pending.push(PendingPacket{packet, outPort});
+            TrySendKv(vl);
             if (!m_retryEvent.IsPending())
             {
                 m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
             }
-            return true;
-        }
-        if (kvHeader.GetOpcode() == static_cast<uint8_t>(KvOpcode::KV_DONE))
-        {
-            flow.pending.push(PendingPacket{packet, inPort});
-            TrySendQp(key);
-            flow.kvPushActive = false;
-            if (flow.kvCreditAccum > 0)
-            {
-                SendKvCredit(key, flow.kvCreditAccum, inPort);
-                flow.kvCreditAccum = 0;
-            }
-            TryKvDoorbell(key);
             return true;
         }
         return false;
@@ -853,69 +833,91 @@ UbDpu::DirectForwardKvFrame(Ptr<Packet> packet, uint32_t inPort, uint32_t outPor
 }
 
 void
-UbDpu::TryKvDoorbell(const DpuFlowKey& key)
+UbDpu::TryKvDoorbell(uint8_t vl)
 {
-    DpuFlowState& flow = GetOrCreateFlowState(key);
-    if (flow.kvPushActive || flow.pendingRequests.empty())
-    {
-        return;
-    }
+    KvVlState& st = m_kvVl[vl];
     Ptr<Node> node = GetObject<Node>();
     if (node == nullptr)
     {
         return;
     }
-    const PendingPacket& front = flow.pendingRequests.front();
-    const uint32_t ubPort = front.inPortId;
-    Ptr<UbPort> outDev = DynamicCast<UbPort>(node->GetDevice(ubPort));
-    if (outDev == nullptr)
+    // Doorbell == permission to push the WHOLE request (no mid-WQE pacing), so a request is
+    // released only when the per-VL receive buffer can absorb its full length. The reserved
+    // accounting turns the buffer into the backlog bound: the union is never asked to carry
+    // what this gateway cannot hold, and several WQEs may be in flight only as the buffer
+    // allows (concurrency = buffer / WQE size).
+    while (!st.requests.empty())
     {
-        return;
+        const PendingPacket& front = st.requests.front();
+        Ptr<Packet> peek = front.packet->Copy();
+        UbDatalinkPacketHeader dl;
+        UbCna16NetworkHeader cna;
+        UbKvHeader kv;
+        peek->RemoveHeader(dl);
+        peek->RemoveHeader(cna);
+        peek->RemoveHeader(kv);
+        const uint64_t length = kv.GetLength();
+        if (st.reservedBytes + length > m_kvRxBuffersBytes)
+        {
+            break; // would overflow the receive buffer: wait for the RoCE side to drain
+        }
+        const uint32_t ubPort = front.inPortId;
+        Ptr<UbPort> outDev = DynamicCast<UbPort>(node->GetDevice(ubPort));
+        if (outDev == nullptr ||
+            !outDev->EnqueueToEgress(std::make_tuple(ubPort, vl, front.packet)))
+        {
+            break; // UB egress full: hold the doorbell, retry later
+        }
+        outDev->TriggerTransmit();
+        st.reservedBytes += length;
+        st.requests.pop();
     }
-    if (!outDev->EnqueueToEgress(std::make_tuple(ubPort, key.vl, front.packet)))
-    {
-        return;
-    }
-    outDev->TriggerTransmit();
-    flow.pendingRequests.pop();
-    flow.kvPushActive = true;
-    flow.kvCreditAccum = 0;
-    // Initial push window: the ASU may push this many bytes before waiting for credits.
-    SendKvCredit(key, m_pullWindowBytes, ubPort);
 }
 
 void
-UbDpu::SendKvCredit(const DpuFlowKey& key, uint64_t bytes, uint32_t ubPort)
+UbDpu::TrySendKv(uint8_t vl)
 {
-    if (bytes == 0)
-    {
-        return;
-    }
+    KvVlState& st = m_kvVl[vl];
     Ptr<Node> node = GetObject<Node>();
-    if (node == nullptr || !IsUbSide(ubPort))
+    if (node == nullptr || st.pending.empty())
     {
         return;
     }
-    Ptr<Packet> packet = Create<Packet>();
-    UbKvHeader kvHeader;
-    kvHeader.SetOpcode(static_cast<uint8_t>(KvOpcode::KV_CREDIT));
-    kvHeader.SetVl(key.vl);
-    kvHeader.SetKvAddr(bytes); // credit bytes travel in the 64-bit address field
-    packet->AddHeader(kvHeader);
-    UbCna16NetworkHeader cnaHeader;
-    cnaHeader.SetScna(static_cast<uint16_t>(utils::NodeIdToCna16(key.destinationNodeId)));
-    cnaHeader.SetDcna(static_cast<uint16_t>(utils::NodeIdToCna16(key.sourceNodeId)));
-    cnaHeader.SetServiceLevel(key.vl);
-    cnaHeader.SetNlp(UB_CNA_NLP_KVPUSH);
-    packet->AddHeader(cnaHeader);
-    UbDataLink::AddPacketHeader(packet,
-                                false,
-                                false,
-                                key.vl,
-                                key.vl,
-                                RoutingType::PER_FLOW_SHORTEST_PATHS,
-                                UbDatalinkHeaderConfig::PACKET_CNA16);
-    SendPacket(packet, ubPort, ubPort, key.vl);
+    Ptr<UbPort> lastSent = nullptr;
+    while (!st.pending.empty())
+    {
+        const PendingPacket& front = st.pending.front();
+        Ptr<UbPort> outDevice = DynamicCast<UbPort>(node->GetDevice(front.inPortId));
+        if (outDevice == nullptr)
+        {
+            break;
+        }
+        if (IsRoceVlPaused(front.inPortId, vl))
+        {
+            break; // RoCE PFC has paused this VL: hold in the receive buffer
+        }
+        Ptr<UbEgressQueue> egress = outDevice->GetUbQueue();
+        if (egress != nullptr && !egress->CanEnqueue(front.packet->GetSize()))
+        {
+            break; // RoCE egress queue full: hold, retry later
+        }
+        if (!outDevice->EnqueueToEgress(std::make_tuple(front.inPortId, vl, front.packet)))
+        {
+            break;
+        }
+        // Forwarded to the RoCE wire: release the reservation (a WQE forwards exactly its
+        // own length over its lifetime, so the DONE marker only saturates the accounting).
+        const uint64_t size = front.packet->GetSize();
+        st.reservedBytes = st.reservedBytes > size ? st.reservedBytes - size : 0;
+        st.pending.pop();
+        lastSent = outDevice;
+    }
+    if (lastSent != nullptr)
+    {
+        lastSent->TriggerTransmit();
+    }
+    // Reservation released: the request queue may now fit the next whole WQE.
+    TryKvDoorbell(vl);
 }
 
 void
@@ -925,6 +927,10 @@ UbDpu::RetryHeldFlows()
     {
         TrySendQp(entry.first);
         TryDoorbell(entry.first);
+    }
+    for (auto& entry : m_kvVl)
+    {
+        TrySendKv(entry.first);
     }
     m_retryEvent = Simulator::Schedule(m_rpUpdateInterval, &UbDpu::RetryHeldFlows, this);
 }
